@@ -1,0 +1,8 @@
+gray-lane-verify
+Copyright 2026 Gray
+
+Licensed under the Apache License, Version 2.0 (the LICENSE file beside this one).
+
+The published file gray-lane-verify-<version>.mjs and the container image also contain third-party code, which keeps
+its own license. THIRD_PARTY_NOTICES, published beside the file and inside the image, lists each package with its
+license and notice texts; deploy/lane-verify/bundle.mjs writes it.

@@ -1,0 +1,16 @@
+{
+  "schema": "gray-public-source/1",
+  "image": "gray-lane-verify",
+  "image_repository": "ghcr.io/gray-ai-dev/gray-lane-verify",
+  "image_ref": "ghcr.io/gray-ai-dev/gray-lane-verify:1.0.0@sha256:a12d1d9a4321602abfe28f126bc4523f8762348c3f8408696fe5f2afdfcd97f3",
+  "tag": "v1.0.0-9b1b6e3b50d8",
+  "version": "v1.0.0",
+  "commit": "9b1b6e3b50d814b480806b46df847158bf829d3e",
+  "commit_time": 1795089136,
+  "files": 157,
+  "npm_packages_bundled": 30,
+  "bundle": "gray-lane-verify-1.0.0.mjs",
+  "bundle_sha256": "sha256:91b37b79e626078ce7a2897059e3991ab1caef01e7962a45faaab44aac657b87",
+  "notices_sha256": "sha256:7e596fbea96a64865d9a0f16a219899342b4ae62570286c00616a569adb1c17d",
+  "license": "Apache-2.0"
+}
