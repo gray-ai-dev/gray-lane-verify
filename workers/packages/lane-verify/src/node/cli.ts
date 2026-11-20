@@ -110,8 +110,15 @@
  * the list Gray publishes for it (the entry's own list for an origin, the stack list for `--via`) under the built-in
  * keys, as `check` does.
  *
+ * `receipt` and `check` on a receipt of a request that reached the VM through Gray's API (docs/design/one-address.md:
+ * `api_version` `aci/1+gray-api`, `arrival: "gray_api"`) run every check as for any receipt; the one more,
+ * `client_connection`, fails, because the client's TLS ended at Cloudflare and not in the VM. When it is the only failure
+ * the verdict is `VALID, NOT END TO END: arrived through Gray's API` and the exit code 3: the receipt is genuine, and the
+ * leg from the client to the VM is not covered. The machine output's `ok` is false and its `arrival` is `gray_api`.
+ *
  * Exit codes: 0 every check passed and the requested pinning was accepted, 1 a check failed or the
- * pinning was not accepted (for `check`, also: the entry did not give the receipt), 2 usage or I/O error.
+ * pinning was not accepted (for `check`, also: the entry did not give the receipt), 2 usage or I/O error,
+ * 3 (`receipt`, `check`) the receipt is valid but the request arrived through Gray's API, so it is not end to end.
  */
 import { createHash, randomBytes, X509Certificate } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
@@ -119,7 +126,7 @@ import { resolve } from "node:path";
 import { request as httpsRequest } from "node:https";
 import { pathToFileURL } from "node:url";
 import type { PeerCertificate, TLSSocket } from "node:tls";
-import { adoptKeyset, parseAttestationReportText, parseReceiptText, reportKeysetValue, type RelayStackChanges, type SealedKeyset } from "@gray/attest";
+import { adoptKeyset, parseAttestationReportText, parseReceiptText, RECEIPT_ARRIVAL_GRAY_API, reportKeysetValue, type RelayStackChanges, type SealedKeyset } from "@gray/attest";
 import { get, isObject, parseStrict, toJsonString, type Json, type JsonObject } from "@gray/json";
 import { isLaneProtocol } from "@gray/lane";
 import { verifyAttestation, type AttestationVerification, type QuoteVerifier, type VerifyCheck } from "../attestation.ts";
@@ -387,7 +394,9 @@ function usage(): string {
     "  --verifier-module is an advanced test/relying-party seam.",
     "",
     "exit codes: 0 all checks passed and pinning accepted, 1 a check failed or pinning was not",
-    "            accepted (check: or the entry did not give the receipt), 2 usage/IO error",
+    "            accepted (check: or the entry did not give the receipt), 2 usage/IO error,",
+    "            3 (receipt, check) VALID, NOT END TO END: the receipt is genuine, and the request",
+    "            arrived through Gray's API, so your connection did not end in the attested VM",
     "",
   ].join("\n");
 }
@@ -986,7 +995,7 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
     : await peerChecks({ flags: peerFlags, origin, receiptText, receipt, receivedBody, templates, ca, nowSecs, quoteVerifier });
 
   const ok = receipt.ok && (peers === null || peers.ok);
-  const verdict = ok ? (attested.verification.osPinned ? "PASS" : "PASS (OS UNPINNED)") : "FAIL";
+  const outcome = receiptOutcome(receipt, peers === null || peers.ok, attested.verification.osPinned);
   out(`gray-lane-verify receipt ${receiptPath}\n`);
   out(`${pinned.line}\n`);
   out(laneLine);
@@ -997,10 +1006,25 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
   }]);
   printChecks(receipt.checks);
   if (peers !== null) printChecks(peers.checks);
-  out(`VERDICT: ${verdict}\n`);
+  out(`VERDICT: ${outcome.verdict}\n`);
   const machine = withLaneOrigin(receiptMachine({ attested, attestedOk, pins, receipt }), laneOrigin);
   out(`${toJsonString(peers === null ? machine : { ...machine, ok: machine.ok === true && peers.ok, peers: peersMachine(peers) })}\n`);
-  return ok ? 0 : 1;
+  return ok ? 0 : outcome.code;
+}
+
+/** `receipt` and `check`'s verdict for a receipt that verified, read with the other checks (`others`). */
+export const NOT_END_TO_END_VERDICT = "VALID, NOT END TO END: arrived through Gray's API";
+/** The exit code of `NOT_END_TO_END_VERDICT`. */
+export const EXIT_NOT_END_TO_END = 3;
+
+/**
+ * The verdict line and exit code of a receipt's checks, with whether every check but the arrival passed (`valid`): a
+ * receipt whose only failed check is `client_connection` is genuine and not end to end (docs/design/one-address.md).
+ */
+function receiptOutcome(receipt: Awaited<ReturnType<typeof verifyResponseReceiptText>>, others: boolean, osPinned: boolean): { readonly verdict: string; readonly code: number; readonly valid: boolean } {
+  if (!others || receipt.verdict === "fail") return { verdict: "FAIL", code: 1, valid: false };
+  if (receipt.verdict === "not_end_to_end") return { verdict: `${NOT_END_TO_END_VERDICT}${osPinned ? "" : " (OS UNPINNED)"}`, code: EXIT_NOT_END_TO_END, valid: true };
+  return { verdict: osPinned ? "PASS" : "PASS (OS UNPINNED)", code: 0, valid: true };
 }
 
 /**
@@ -1070,7 +1094,7 @@ async function peerChecks(input: {
   readonly quoteVerifier: QuoteVerifier;
 }): Promise<PeerReceiptsVerification> {
   const parsed = parseReceiptText(input.receiptText);
-  if (!input.receipt.ok || !parsed.ok || input.receipt.receiptId === null) {
+  if (input.receipt.verdict === "fail" || !parsed.ok || input.receipt.receiptId === null) {
     return { ok: false, checks: [{ id: "peers", status: "skip", detail: "not checked: the outer receipt did not verify" }], peers: [] };
   }
   const outer = parsed.value;
@@ -1261,6 +1285,8 @@ function receiptMachine(input: {
     forwarded_body_sha256: receipt?.forwardedBodyHash ?? null,
     response_body_sha256: receipt?.responseBodyHash ?? null,
     relay_image: receipt?.relayImage ?? null,
+    // docs/design/one-address.md: only on a receipt that names it, so every other machine line is as it was.
+    ...(receipt?.arrival === null || receipt?.arrival === undefined ? {} : { arrival: safeToken(receipt.arrival) }),
     appended: (receipt?.appended ?? []).map((append) => ({
       // Template ids are attacker-controlled signed data; a token-only form keeps a fake verdict
       // out of the machine JSON as well as out of the printed transcript.
@@ -1697,7 +1723,8 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
   }
 
   const ok = receipt.ok && idCheck.every((entry) => entry.status !== "fail") && (peers === null || peers.ok);
-  const verdict = ok ? (attested.verification.osPinned ? "PASS" : "PASS (OS UNPINNED)") : "FAIL";
+  const outcome = receiptOutcome(receipt, idCheck.every((entry) => entry.status !== "fail") && (peers === null || peers.ok), attested.verification.osPinned);
+  const verdict = outcome.verdict;
   preamble();
   out(fetchLine);
   out(laneLine);
@@ -1709,7 +1736,7 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
   printChecks(idCheck);
   printChecks(receipt.checks);
   if (peers !== null) printChecks(peers.checks);
-  if (ok) {
+  if (outcome.valid) {
     printCheckSummary({
       receiptId: receipt.receiptId,
       fetched,
@@ -1726,7 +1753,7 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
   out(`VERDICT: ${verdict}\n`);
   const machine = checkMachine(receiptMachine({ attested, attestedOk, pins, receipt }), ok, verdict, peers);
   out(`${toJsonString({ ...machine, checks: [...idCheck.map(checkValue), ...(machine.checks as Json[])] })}\n`);
-  return ok ? 0 : 1;
+  return ok ? 0 : outcome.code;
 }
 
 /** What a passing `check` covered, in plain lines (facts from the checks above, never a verdict of their own). */
@@ -1771,6 +1798,9 @@ function printCheckSummary(input: {
   const rewritten = [...counted].map(([path, count]) => (count === 1 ? transcriptText(path) : `${transcriptText(path)} (${String(count)} events)`)).join(", ");
   out(`  changes    Gray declared ${String(requestOps + peerOps)} change(s) to the request; answer rewrites: ${rewritten === "" ? "none" : rewritten}\n`);
   out(`  answer     ${input.responseGiven ? "the bytes you received match what the receipt records" : "not compared: pass --response <the raw bytes you received> to compare them"}\n`);
+  if (input.receipt.arrival === RECEIPT_ARRIVAL_GRAY_API) {
+    out("  client     not covered: the request arrived through Gray's API, where your TLS connection ended at Cloudflare; send it to the entry itself for a connection that ends in the VM\n");
+  }
 }
 
 function loadTemplates(path: string): TemplateText[] {
