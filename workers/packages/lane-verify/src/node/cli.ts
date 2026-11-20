@@ -90,8 +90,9 @@
  * VMs. The entry's (outer) receipt names each stack VM only by a commitment; for each attempt number it names, the CLI
  * fetches `GET <origin>/v1/aci/receipts/<id>/peers/<n>` with the key that made the request (from the environment's
  * `GRAY_API_KEY`, never a flag: a command line is visible to other processes) and checks, with lines `peer:<n>:…`:
- * the stack VM's report against Gray's signed stack list (`--allow-stack`, the same `--release-key`, and with
- * `--allow-stack-freshness` the same `--freshness-key`), that the commitment opens to that boot, and the stack VM's
+ * the stack VM's report against Gray's signed stack list (`--allow-stack`, the same `--release-key`, and with a
+ * `--freshness-key` the freshness document `--allow-stack-freshness` names or, without it, the one beside the list,
+ * which counts as absent when it cannot be read), that the commitment opens to that boot, and the stack VM's
  * inner receipt under its attested keyset, tied to this receipt by its `peer.entry`, with the same request in and,
  * for the attempt that served, the same answer out. The inner receipt's attempts print what the relay changed in the
  * same form as a direct receipt's (`peer:<n>:attempt:<k>:relay_changes: unchanged…` or `changed by the deployment: …`).
@@ -387,7 +388,9 @@ function usage(): string {
     "                          made the request in the environment as GRAY_API_KEY)",
     "  --allow-stack <file>    with --peers: Gray's signed stack release list (lane/stack/release-list.json),",
     "                          under the same --release-key",
-    "  --allow-stack-freshness <file>  its freshness document, under the same --freshness-key",
+    "  --allow-stack-freshness <file>  its freshness document, under the same --freshness-key. Without it, when a",
+    "                          freshness key is pinned, the .freshness.json beside --allow-stack is read, and",
+    "                          one that cannot be read leaves the list current for a day after its issued_at",
     "",
     "  Plain PASS requires both a pinned compose hash and a pinned OS image.",
     "  --ca <pem> replaces Node's default trust store; it is not added to it.",
@@ -1067,12 +1070,33 @@ function readPeerFlags(args: ParsedArgs, origin: URL | null, pins: PinFlags): Pe
   const apiKey = process.env.GRAY_API_KEY;
   if (apiKey === undefined || apiKey === "") throw new UsageError("receipt --peers needs the key that made the request in the environment: GRAY_API_KEY");
   if (!/^[\x21-\x7e]{1,4096}$/.test(apiKey)) throw new UsageError("GRAY_API_KEY is not an API key (printable ASCII without spaces)");
+  const freshnessFrom = stackFreshnessSource(stackPath, stackFreshness ?? null, pins.freshnessKey);
+  let freshnessText: string | null = null;
+  if (freshnessFrom !== null) {
+    try {
+      freshnessText = readText(freshnessFrom.source, "stack freshness document");
+    } catch (error) {
+      if (!freshnessFrom.optional) throw error;
+    }
+  }
   const list: PeerReleaseList = {
     text: readText(stackPath, "stack release list"),
     publicKey: pins.releaseKey,
-    ...(stackFreshness === undefined || pins.freshnessKey === null ? {} : { freshness: { text: readText(stackFreshness, "stack freshness document"), publicKey: pins.freshnessKey } }),
+    ...(freshnessFrom === null || pins.freshnessKey === null ? {} : { freshness: { text: freshnessText, publicKey: pins.freshnessKey } }),
   };
   return { apiKey, list };
+}
+
+/**
+ * Where the stack list's freshness document is read from (D135, D137). With no freshness key pinned there is none, and
+ * the list is current for a day after its `issued_at`. `--allow-stack-freshness` names it, and one that cannot be read
+ * is an error. Without that flag it is the document beside the list (`releaseFreshnessLocation`: `.json` replaced by
+ * `.freshness.json`, where Gray's signer writes it), as for the built-in lists; one that cannot be read counts as absent,
+ * so the list keeps only its own day and an older list still fails.
+ */
+function stackFreshnessSource(list: string, given: string | null, freshnessKey: Uint8Array | null): { readonly source: string; readonly optional: boolean } | null {
+  if (freshnessKey === null) return null;
+  return given !== null ? { source: given, optional: false } : { source: releaseFreshnessLocation(list), optional: true };
 }
 
 /** The largest `/peers/{n}` answer read: a report (MAX_REPORT_BYTES) and an inner receipt (at most 64 KiB) with room. */
@@ -1595,9 +1619,9 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
   if (stackFreshnessGiven !== null && stackGiven === null) throw new UsageError("--allow-stack-freshness goes with --allow-stack");
   if (stackFreshnessGiven !== null && pins.freshnessKey === null) throw new UsageError("--allow-stack-freshness needs --freshness-key <64 hex>");
   const stack = stackGiven !== null
-    ? { list: stackGiven, freshness: stackFreshnessGiven, optional: false }
+    ? { list: stackGiven, freshness: stackFreshnessGiven }
     : defaults.entry !== null
-      ? { list: defaults.entry.stackList, freshness: releaseFreshnessLocation(defaults.entry.stackList), optional: true }
+      ? { list: defaults.entry.stackList, freshness: null }
       : null;
   const ca = args.flags.has("ca") ? readText(args.flags.get("ca") as string, "CA certificate") : undefined;
   const nowSecs = args.flags.has("now") ? parseUnixSeconds(args.flags.get("now") as string) : nowSeconds();
@@ -1708,15 +1732,16 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
     } else if (stack === null) {
       peers = { ok: false, peers: [], checks: [{ id: "peers", status: "fail", detail: `the receipt names ${String(peerCount)} attempt(s) in a provider's VM: pass --allow-stack <Gray's signed stack release list> to check them` }] };
     } else {
-      const freshnessText = stack.freshness === null || pins.freshnessKey === null
-        ? undefined
-        : stack.optional
-          ? await readSource(stack.freshness, "stack freshness document").catch(() => null)
-          : await readSource(stack.freshness, "stack freshness document");
+      const freshnessFrom = stackFreshnessSource(stack.list, stack.freshness, pins.freshnessKey);
+      const freshnessText = freshnessFrom === null
+        ? null
+        : freshnessFrom.optional
+          ? await readSource(freshnessFrom.source, "stack freshness document").catch(() => null)
+          : await readSource(freshnessFrom.source, "stack freshness document");
       const list: PeerReleaseList = {
         text: await readSource(stack.list, "stack release list"),
         publicKey: pins.releaseKey,
-        ...(freshnessText === undefined || pins.freshnessKey === null ? {} : { freshness: { text: freshnessText, publicKey: pins.freshnessKey } }),
+        ...(freshnessFrom === null || pins.freshnessKey === null ? {} : { freshness: { text: freshnessText, publicKey: pins.freshnessKey } }),
       };
       peers = await peerChecks({ flags: { apiKey, list }, origin: attestAt, receiptText, receipt, receivedBody, templates, ca, nowSecs, quoteVerifier });
     }
