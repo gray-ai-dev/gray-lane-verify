@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuilds gray-lane-verify 1.3.0 (v1.3.0-75cf54a9695b) from this tree with the build commands of deploy/lane-verify/release.sh
+# Rebuilds gray-lane-verify 1.4.0 (v1.4.0-125119103e59) from this tree with the build commands of deploy/lane-verify/release.sh
 # (the script Gray publishes with): the one-file bundle, then the image for one platform. Prints the bundle's sha256 and
 # the platform's OCI manifest digest, and the THIRD_PARTY_NOTICES' sha256. Compare them with what Gray published
 # (README.md, "Rebuild"):
@@ -15,9 +15,9 @@
 # registry (npm ci) and Docker Hub (the pinned Node base image).
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-commit=75cf54a9695b65d2b569dd7f2e9b94821e339a71
-epoch=1795231276
-version=1.3.0
+commit=125119103e59052cdf010950d5b60898ae16e69a
+epoch=1795276709
+version=1.4.0
 platform=${PLATFORM:-linux/amd64}
 out="$here/rebuild"
 command -v node >/dev/null 2>&1 || { echo "rebuild.sh: node is required" >&2; exit 2; }

@@ -13,7 +13,7 @@
  *         --allow <release-list.json> --release-key <64 hex> [--accept-os-unpinned]
  *         [--allow-freshness <release-list.freshness.json> --freshness-key <64 hex>]
  *         [--response <raw response file>] [--templates <texts.json>]
- *         [--protocol <anthropic_messages|open_ai_chat|open_ai_responses|gemini>]
+ *         [--protocol <anthropic_messages|open_ai_chat|open_ai_responses|gemini|a standard API's name>]
  *         [--peers --allow-stack <stack release-list.json> [--allow-stack-freshness <file>]]
  *         [--ca <pem>] [--now <unix>] [--pccs <url>] [--verifier-module <file>]
  *
@@ -125,6 +125,13 @@
  * `covered:` block two `translated` lines: what the replay proves for the request, and that the answer's translation
  * back is not replayed.
  *
+ * `receipt` and `check` on a receipt of a standard API (docs/design/standard-media-at-entry.md section 2.4: embeddings,
+ * rerank, images, speech, transcriptions, translations, videos, System One) replay Gray's declared ops under
+ * `gray-lane-rewrites-v2` (receipt.ts). When the request was a `multipart/form-data` form and Gray changed a field of
+ * it (`set_form_field`, `remove_form_field`), the replay reads the form by the boundary of its own first line, so the
+ * command takes nothing more than for a JSON request: `--request` is the whole body as sent, files included. A body
+ * that does not begin with its boundary line does not replay.
+ *
  * Exit codes: 0 every check passed and the requested pinning was accepted, 1 a check failed or the
  * pinning was not accepted (for `check`, also: the entry did not give the receipt), 2 usage or I/O error,
  * 3 (`receipt`, `check`) the receipt is valid but the request arrived through Gray's API, so it is not end to end.
@@ -137,7 +144,7 @@ import { pathToFileURL } from "node:url";
 import type { PeerCertificate, TLSSocket } from "node:tls";
 import { adoptKeyset, parseAttestationReportText, parseReceiptText, RECEIPT_ARRIVAL_GRAY_API, reportKeysetValue, type RelayStackChanges, type SealedKeyset } from "@gray/attest";
 import { get, isObject, parseStrict, toJsonString, type Json, type JsonObject } from "@gray/json";
-import { isLaneProtocol } from "@gray/lane";
+import { isRewriteApi } from "@gray/lane";
 import { verifyAttestation, type AttestationVerification, type QuoteVerifier, type VerifyCheck } from "../attestation.ts";
 import { LANE_ORIGIN_HEADER, readLaneOrigin } from "../lane-origin.ts";
 import { verifyResponseReceiptText, type ReceiptProtocol, type StackReceiptSummary, type TemplateText } from "../receipt.ts";
@@ -346,7 +353,7 @@ function usage(): string {
     "           --allow <release-list.json> --release-key <64 hex> [--accept-os-unpinned]",
     "           [--allow-freshness <file> --freshness-key <64 hex>]",
     "           [--response <raw response file>] [--templates <texts.json>]",
-    "           [--protocol <anthropic_messages|open_ai_chat|open_ai_responses|gemini>]",
+    "           [--protocol <anthropic_messages|open_ai_chat|open_ai_responses|gemini|...>]",
     "           [--peers --allow-stack <stack release-list.json> [--allow-stack-freshness <file>]]",
     "           [--ca <pem>] [--now <unix>] [--pccs <url>] [--verifier-module <file>]",
     "       gray-lane-verify check (<receipt id> | --receipt <receipt.json>) --request <body file>",
@@ -361,7 +368,7 @@ function usage(): string {
     "                          taken from the environment as GRAY_API_KEY (never a flag, never printed)",
     "  --receipt <file>        a receipt you saved instead; GRAY_API_KEY is then needed only when the",
     "                          receipt names attempts in a provider's VM",
-    "  --request <file>        the exact request body you sent",
+    "  --request <file>        the exact request body you sent (a multipart form whole, files included)",
     "  --response <file>       the raw bytes you received (SSE framing included): also checks the answer",
     `  --origin <url>          the entry you sent the request to (default ${DEFAULT_ORIGIN})`,
     "  --lane-origin <url>     the answer's x-gray-lane-origin header, when it had one",
@@ -1842,6 +1849,11 @@ function printCheckSummary(input: {
   for (const path of rewrites) counted.set(path, (counted.get(path) ?? 0) + 1);
   const rewritten = [...counted].map(([path, count]) => (count === 1 ? transcriptText(path) : `${transcriptText(path)} (${String(count)} events)`)).join(", ");
   out(`  changes    Gray declared ${String(requestOps + peerOps)} change(s) to the request; answer rewrites: ${rewritten === "" ? "none" : rewritten}\n`);
+  const formOps = input.receipt.modified.filter((op) => op.op === "set_form_field" || op.op === "remove_form_field");
+  if (formOps.length > 0) {
+    out(`  form       Gray changed the field(s) ${formOps.map((op) => transcriptText(op.path)).join(", ")} of your multipart form and no other byte, files included; `
+      + "replayed on the form as the boundary of its first line reads it. The receipt does not carry the content-type Gray sent the provider\n");
+  }
   const translation = input.receipt.translation;
   if (translation !== null) {
     const cap = translation.output_cap === null ? "" : `, output cap ${translation.output_cap.toString()} written by Gray`;
@@ -1881,7 +1893,7 @@ function loadTemplates(path: string): TemplateText[] {
 }
 
 function parseProtocol(value: string): ReceiptProtocol {
-  if (value !== "gemini" && !isLaneProtocol(value)) throw new UsageError(`unknown protocol ${JSON.stringify(value)}`);
+  if (value !== "gemini" && !isRewriteApi(value)) throw new UsageError(`unknown protocol ${JSON.stringify(value)}`);
   return value;
 }
 
