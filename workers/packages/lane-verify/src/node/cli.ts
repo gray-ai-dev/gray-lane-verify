@@ -117,6 +117,14 @@
  * the verdict is `VALID, NOT END TO END: arrived through Gray's API` and the exit code 3: the receipt is genuine, and the
  * leg from the client to the VM is not covered. The machine output's `ok` is false and its `arrival` is `gray_api`.
  *
+ * `receipt` and `check` on a receipt of a request Gray translated onto another text API for a provider's own API
+ * (`request.translated`, docs/design/lane-provider-routes.md section 10) replay the translation (receipt.ts): the
+ * `translation` line names the two APIs and the dropped fields, and `forwarded_body_hash` passes when the forwarded
+ * body is that translation of the customer's bytes with Gray's declared ops. The verdict is as for any receipt. The
+ * machine output gains `translation` (`from`, `to`, `dropped`, `output_cap`), only on such receipts, and `check`'s
+ * `covered:` block two `translated` lines: what the replay proves for the request, and that the answer's translation
+ * back is not replayed.
+ *
  * Exit codes: 0 every check passed and the requested pinning was accepted, 1 a check failed or the
  * pinning was not accepted (for `check`, also: the entry did not give the receipt), 2 usage or I/O error,
  * 3 (`receipt`, `check`) the receipt is valid but the request arrived through Gray's API, so it is not end to end.
@@ -1311,6 +1319,18 @@ function receiptMachine(input: {
     relay_image: receipt?.relayImage ?? null,
     // docs/design/one-address.md: only on a receipt that names it, so every other machine line is as it was.
     ...(receipt?.arrival === null || receipt?.arrival === undefined ? {} : { arrival: safeToken(receipt.arrival) }),
+    // A translated request (`request.translated`): only on a receipt that names one, as `arrival`. The APIs are a closed
+    // vocabulary and the dropped names lower-case identifiers (the event's schema).
+    ...(receipt?.translation === null || receipt?.translation === undefined
+      ? {}
+      : {
+          translation: {
+            from: receipt.translation.from,
+            to: receipt.translation.to,
+            dropped: [...receipt.translation.dropped],
+            output_cap: receipt.translation.output_cap,
+          },
+        }),
     appended: (receipt?.appended ?? []).map((append) => ({
       // Template ids are attacker-controlled signed data; a token-only form keeps a fake verdict
       // out of the machine JSON as well as out of the printed transcript.
@@ -1822,6 +1842,13 @@ function printCheckSummary(input: {
   for (const path of rewrites) counted.set(path, (counted.get(path) ?? 0) + 1);
   const rewritten = [...counted].map(([path, count]) => (count === 1 ? transcriptText(path) : `${transcriptText(path)} (${String(count)} events)`)).join(", ");
   out(`  changes    Gray declared ${String(requestOps + peerOps)} change(s) to the request; answer rewrites: ${rewritten === "" ? "none" : rewritten}\n`);
+  const translation = input.receipt.translation;
+  if (translation !== null) {
+    const cap = translation.output_cap === null ? "" : `, output cap ${translation.output_cap.toString()} written by Gray`;
+    out(`  translated your request, by Gray from ${translation.from} to ${translation.to}${cap}, dropped: ${translation.dropped.length === 0 ? "none" : translation.dropped.join(", ")}; `
+      + "the forwarded body is exactly that translation of your bytes with Gray's declared ops, replayed here with the same open-source code\n");
+    out(`  translated the answer, back to ${translation.from}: not replayed; the receipt hashes the answer as you received it, and a receipt of a provider's API carries no digest of the provider's answer\n`);
+  }
   out(`  answer     ${input.responseGiven ? "the bytes you received match what the receipt records" : "not compared: pass --response <the raw bytes you received> to compare them"}\n`);
   if (input.receipt.arrival === RECEIPT_ARRIVAL_GRAY_API) {
     out("  client     not covered: the request arrived through Gray's API, where your TLS connection ended at Cloudflare; send it to the entry itself for a connection that ends in the VM\n");
