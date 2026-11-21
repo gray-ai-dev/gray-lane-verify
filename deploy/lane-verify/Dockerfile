@@ -13,7 +13,7 @@
 #
 # No RUN step: the image is the base image's layers, one layer with the bundle and its licenses, and the working
 # directory, the same for every platform.
-ARG NODE_BASE=node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5
+ARG NODE_BASE=node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c
 FROM ${NODE_BASE}
 
 LABEL org.opencontainers.image.title="gray-lane-verify" \
