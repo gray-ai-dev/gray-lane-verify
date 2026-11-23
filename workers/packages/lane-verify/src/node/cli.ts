@@ -1010,7 +1010,18 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
 
   const peers = peerFlags === null || origin === null
     ? null
-    : await peerChecks({ flags: peerFlags, origin, receiptText, receipt, receivedBody, templates, ca, nowSecs, quoteVerifier });
+    : await peerChecks({
+        flags: peerFlags,
+        origin,
+        receiptText,
+        receipt,
+        receivedBody,
+        ...(responseBytes === undefined ? {} : { responseBytes }),
+        templates,
+        ca,
+        nowSecs,
+        quoteVerifier,
+      });
 
   const ok = receipt.ok && (peers === null || peers.ok);
   const outcome = receiptOutcome(receipt, peers === null || peers.ok, attested.verification.osPinned);
@@ -1127,6 +1138,7 @@ async function peerChecks(input: {
   readonly receiptText: string;
   readonly receipt: Awaited<ReturnType<typeof verifyResponseReceiptText>>;
   readonly receivedBody: Uint8Array;
+  readonly responseBytes?: Uint8Array;
   readonly templates: readonly TemplateText[];
   readonly ca: string | undefined;
   readonly nowSecs: bigint;
@@ -1157,6 +1169,7 @@ async function peerChecks(input: {
   return verifyPeerReceipts({
     outer,
     receivedBody: input.receivedBody,
+    ...(input.responseBytes === undefined ? {} : { responseBytes: input.responseBytes }),
     templates: input.templates,
     releaseList: input.flags.list,
     quoteVerifier: input.quoteVerifier,
@@ -1770,7 +1783,18 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
         publicKey: pins.releaseKey,
         ...(freshnessFrom === null || pins.freshnessKey === null ? {} : { freshness: { text: freshnessText, publicKey: pins.freshnessKey } }),
       };
-      peers = await peerChecks({ flags: { apiKey, list }, origin: attestAt, receiptText, receipt, receivedBody, templates, ca, nowSecs, quoteVerifier });
+      peers = await peerChecks({
+        flags: { apiKey, list },
+        origin: attestAt,
+        receiptText,
+        receipt,
+        receivedBody,
+        ...(responseBytes === undefined ? {} : { responseBytes }),
+        templates,
+        ca,
+        nowSecs,
+        quoteVerifier,
+      });
     }
   }
 
