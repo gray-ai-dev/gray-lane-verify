@@ -1,6 +1,6 @@
-# gray-lane-verify 1.5.0 (v1.5.0-5e6d0e4cfd21)
+# gray-lane-verify 1.6.0 (v1.6.0-438060d278ca)
 
-The source of `gray-lane-verify` 1.5.0, built from Gray's commit `5e6d0e4cfd21040ddc5778ac484ec33218edb771`. gray-lane-verify checks one answer
+The source of `gray-lane-verify` 1.6.0, built from Gray's commit `438060d278cab80495b85f16f72d5029b6a465e3`. gray-lane-verify checks one answer
 from Gray's confidential entry in one command. It fetches the answer's signed receipt and checks the remote attestation
 of the confidential VM that signed it against Gray's signed release list. It then verifies the receipt under the keys
 that attestation shows. When a provider's confidential VM served the answer, it checks that VM's attestation and the
@@ -8,20 +8,20 @@ receipt the VM made, with every change Gray declared to the request and the answ
 
 gray-lane-verify is licensed under the Apache License, Version 2.0 (`LICENSE`, `NOTICE`).
 
-This tree holds exactly the 161 files that the published bundle `gray-lane-verify-1.5.0.mjs` and the image
-`ghcr.io/gray-ai-dev/gray-lane-verify:1.5.0` are built from, at the paths they have in Gray's repository, plus the files Gray
+This tree holds exactly the 167 files that the published bundle `gray-lane-verify-1.6.0.mjs` and the image
+`ghcr.io/gray-ai-dev/gray-lane-verify:1.6.0` are built from, at the paths they have in Gray's repository, plus the files Gray
 writes for each release: this README, `SOURCE.json`, `rebuild.sh`, `.gitignore`, `LICENSE` and `NOTICE`. Tests,
 documentation and Gray's other services are not included. Each release is one commit in this repository, and its
-parent is the release published before it, so `git diff <previous tag> v1.5.0-5e6d0e4cfd21` shows the code that changed between
+parent is the release published before it, so `git diff <previous tag> v1.6.0-438060d278ca` shows the code that changed between
 the two.
 
 ## Get it
 
 | Form | Where |
 |-|-|
-| One file for Node 22 or later, no install step | `https://releases.usefallback.com/lane-verify/1.5.0/gray-lane-verify-1.5.0.mjs`, with `.sha256` and `.sigstore.json` beside it, and `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES` in the same directory |
-| Container image | `ghcr.io/gray-ai-dev/gray-lane-verify:1.5.0`, also tagged `5e6d0e4cfd21`; the same three files are in `/opt/gray-lane-verify/` |
-| Source | this repository, tag `v1.5.0-5e6d0e4cfd21` |
+| One file for Node 22 or later, no install step | `https://releases.usefallback.com/lane-verify/1.6.0/gray-lane-verify-1.6.0.mjs`, with `.sha256` and `.sigstore.json` beside it, and `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES` in the same directory |
+| Container image | `ghcr.io/gray-ai-dev/gray-lane-verify:1.6.0`, also tagged `438060d278ca`; the same three files are in `/opt/gray-lane-verify/` |
+| Source | this repository, tag `v1.6.0-438060d278ca` |
 
 Gray signs the file and the image with its release key, the cosign public key in
 `deploy/relay/kit/keys/gray-assistant-cosign.pub`. Its SHA-256 is
@@ -30,20 +30,20 @@ repositories. Check a download before you run it:
 
 ```sh
 cosign verify-blob --key gray-assistant-cosign.pub \
-  --bundle gray-lane-verify-1.5.0.mjs.sigstore.json gray-lane-verify-1.5.0.mjs
-deploy/relay/kit/cosign.sh verify-file gray-lane-verify-1.5.0.mjs
-deploy/relay/kit/cosign.sh verify-image ghcr.io/gray-ai-dev/gray-lane-verify:1.5.0
+  --bundle gray-lane-verify-1.6.0.mjs.sigstore.json gray-lane-verify-1.6.0.mjs
+deploy/relay/kit/cosign.sh verify-file gray-lane-verify-1.6.0.mjs
+deploy/relay/kit/cosign.sh verify-image ghcr.io/gray-ai-dev/gray-lane-verify:1.6.0
 ```
 
-`cosign.sh verify-image` prints the commit the image was signed as built from: it is `5e6d0e4cfd21040ddc5778ac484ec33218edb771`.
-`node gray-lane-verify-1.5.0.mjs --version` prints the same commit.
+`cosign.sh verify-image` prints the commit the image was signed as built from: it is `438060d278cab80495b85f16f72d5029b6a465e3`.
+`node gray-lane-verify-1.6.0.mjs --version` prints the same commit.
 
 ## Run it
 
 ```sh
 export GRAY_API_KEY=...   # the key that made the request; read from the environment, never printed
-node gray-lane-verify-1.5.0.mjs check <x-receipt-id> --request request.json --response response.bin
-docker run --rm -v "$PWD:/work" -e GRAY_API_KEY ghcr.io/gray-ai-dev/gray-lane-verify:1.5.0 \
+node gray-lane-verify-1.6.0.mjs check <x-receipt-id> --request request.json --response response.bin
+docker run --rm -v "$PWD:/work" -e GRAY_API_KEY ghcr.io/gray-ai-dev/gray-lane-verify:1.6.0 \
   check <x-receipt-id> --request request.json --response response.bin
 ```
 
@@ -73,11 +73,14 @@ attempt's `peer.forwarded`), and the command replays it. Where the preference as
 (`routing_preference`). Versions before 1.2.0 have no such rule and fail these receipts.
 
 For a provider's own API, the entry may translate a request onto another text API (Chat Completions, Responses,
-Messages, Gemini) and the answer back. The receipt names the translation (`request.translated`), and the command
-replays it with the translation code the entry runs: the forwarded body must be exactly the translation of your
-bytes with Gray's declared ops. The `translation` line and the machine line's `translation` name the two APIs and the
-fields the translated request does not carry. The answer's translation back is not replayed: the receipt hashes the
-answer as you received it. Versions before 1.3.0 fail these receipts.
+Messages, Gemini) and the answer back. The receipt names the translation (`request.translated`) by id, and the
+command replays it with that translation's code: the forwarded body must be exactly the translation of your bytes
+with Gray's declared ops. The entry signs `gray-lane-translation-v2`; receipts of earlier entries name
+`gray-lane-translation-v1`, which the command replays with a frozen copy of the code they ran. A receipt is replayed
+under the id it names and no other. The `translation` line names the id, and with the machine line's `translation`
+the two APIs and the fields the translated request does not carry. The answer's translation back is not replayed: the
+receipt hashes the answer as you received it. Versions before 1.3.0 fail these receipts, and versions before 1.6.0
+fail one that names `gray-lane-translation-v2`.
 
 The command also verifies a receipt of embeddings, rerank, image generations and edits, speech, transcriptions,
 translations, videos and System One, which the entry serves for a provider's own API. Gray's changes to such a request
@@ -114,7 +117,7 @@ before 1.5.0 fail these receipts.
 
 ## What to review
 
-> Review this tree (and `git diff <the tag you run now> v1.5.0-5e6d0e4cfd21`) for any way gray-lane-verify could print
+> Review this tree (and `git diff <the tag you run now> v1.6.0-438060d278ca`) for any way gray-lane-verify could print
 > `VERDICT: PASS` or exit 0 for an answer whose receipt, attestation or release list does not check out, or for one
 > whose receipt says it arrived through Gray's API (`aci/1+gray-api`), or could send
 > the API key anywhere other than the entry origin the user named or a replica that origin's answer named. Trace:
@@ -132,7 +135,7 @@ The tool writes nothing to disk. It prints check lines and hashes, never request
 for the other) with the build commands of `deploy/lane-verify/release.sh`. It prints `rebuild.sh: bundle sha256:…`,
 which must equal the published `.sha256`, `rebuild.sh: notices sha256:…`, the published `THIRD_PARTY_NOTICES`', and
 `rebuild.sh: manifest sha256:…`, which must equal the published image's
-manifest for the same platform: `docker buildx imagetools inspect --raw ghcr.io/gray-ai-dev/gray-lane-verify:1.5.0` lists one
+manifest for the same platform: `docker buildx imagetools inspect --raw ghcr.io/gray-ai-dev/gray-lane-verify:1.6.0` lists one
 manifest per platform. Gray rebuilds this way from this tree before it publishes a tag, and does not publish when
 any of them differs.
 
