@@ -58,7 +58,8 @@ import {
   type RelayStackChanges,
   type RequestModifiedEvent,
 } from "@gray/attest";
-import { isLaneProtocol, replayForwarded, rewriteRuleFor, ruleAllowsValue, textPolicyOf } from "@gray/lane";
+import { isLaneProtocol, rewriteRuleFor, ruleAllowsValue, textPolicyOf } from "@gray/lane";
+import { replayForwarded } from "@gray/lane/receipt";
 import { get, isObject, parseStrict, type Json } from "@gray/json";
 import type { QuoteVerifier } from "./attestation.ts";
 import { verifyPeerAttestation, type PeerReleaseList } from "./peer.ts";
@@ -237,30 +238,61 @@ export interface PeerAnswerError {
 
 /**
  * How long the entry may still hold an outer receipt and its peer records, counted from the receipt's signed
- * `served_at` (1.7.1). The entry keeps both in memory (`createReceiptStore` in the gateway's lane/state.ts) for
- * ENTRY_RECEIPT_RETENTION_SECONDS after it stores them, when the answer ends. The bound adds the longest a request may
- * run (STREAM_TOTAL_SECONDS at its maximum) so that it holds wherever in the request the entry dates `served_at`, and
- * RECEIPT_CLOCK_MARGIN_SECONDS for the difference between the customer's clock and the entry's (the same 300 s as
- * RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS). The gateway's receipt-retention test holds the first two to the entry's.
+ * `served_at` (1.7.1, 1.8.0). The entry keeps both for the outer receipt's signed `retention_seconds` after it stores
+ * them, when the answer ends: 30 days for an entry that persists its receipts (docs/design/persisted-receipts.md
+ * section 3), and ENTRY_RECEIPT_RETENTION_SECONDS, an hour in memory, for a receipt without the member. The bound adds
+ * the longest a request may run (STREAM_TOTAL_SECONDS at its maximum) so that it holds wherever in the request the
+ * entry dates `served_at`, and RECEIPT_CLOCK_MARGIN_SECONDS for the difference between the customer's clock and the
+ * entry's (the same 300 s as RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS). The gateway's receipt-retention test holds the
+ * first two to the entry's. PEER_RECORD_RETENTION_BOUND_SECONDS is the bound of a receipt without the member.
  */
 export const LONGEST_REQUEST_SECONDS = 3_600n;
 export const ENTRY_RECEIPT_RETENTION_SECONDS = 3_600n;
 export const RECEIPT_CLOCK_MARGIN_SECONDS = 300n;
 export const PEER_RECORD_RETENTION_BOUND_SECONDS = LONGEST_REQUEST_SECONDS + ENTRY_RECEIPT_RETENTION_SECONDS + RECEIPT_CLOCK_MARGIN_SECONDS;
+/** What the bound adds to the signed retention: the longest request and the clock margin (3 900 s). */
+export const PEER_RECORD_RETENTION_MARGIN_SECONDS = LONGEST_REQUEST_SECONDS + RECEIPT_CLOCK_MARGIN_SECONDS;
+/** The largest `retention_seconds` a receipt signs (`@gray/attest`: 1 ..= 2^32 - 1). */
+const MAX_RETENTION_SECONDS = (1n << 32n) - 1n;
+
+/**
+ * The retention the outer receipt signs: its `retention_seconds`, ENTRY_RECEIPT_RETENTION_SECONDS when absent (every
+ * receipt before persistence), null when the member is there and outside 1 ..= 2^32 - 1 (never read as a window).
+ */
+function signedRetention(outer: Json): bigint | null {
+  const value = get(outer, "retention_seconds");
+  if (value === undefined || value === null) return ENTRY_RECEIPT_RETENTION_SECONDS;
+  return typeof value === "bigint" && value >= 1n && value <= MAX_RETENTION_SECONDS ? value : null;
+}
+
+/**
+ * The seconds after `served_at` the entry may still hold a receipt's peer records, for its signed `retention_seconds`
+ * (null: a receipt without the member, kept an hour in memory).
+ */
+export function peerRecordRetentionBound(retentionSeconds: bigint | null): bigint {
+  return (retentionSeconds ?? ENTRY_RECEIPT_RETENTION_SECONDS) + PEER_RECORD_RETENTION_MARGIN_SECONDS;
+}
+
+/** The outer receipt's signed `served_at`, or null. */
+function servedAtOf(outer: Json): bigint | null {
+  const servedAt = get(outer, "served_at");
+  return typeof servedAt === "bigint" && servedAt >= 0n ? servedAt : null;
+}
 
 /**
  * The last second the entry may hold the records of `outer`, when the entry answered `404 receipt_not_found` for one of
  * them and `nowSecs` is past it; else null, and the missing record stays a failed check. Only that exact answer counts:
  * the entry gives it for an id it does not hold (expired, unknown or another key's), while every other answer
  * (`peer_attempt_not_found`, 502 `peer_receipt_unavailable` or `peer_receipt_mismatch`, a network error) says
- * something else about a receipt the entry still holds. The time is the outer receipt's own signed `served_at`, which
- * the caller verified, never a time the entry or the network gave.
+ * something else about a receipt the entry still holds. The time is the outer receipt's own signed `served_at` and
+ * `retention_seconds`, which the caller verified, never a time the entry or the network gave.
  */
 function retainedUntilPast(answer: PeerAnswerError, outer: Json, nowSecs: bigint): bigint | null {
   if (answer.status !== 404 || answer.code !== "receipt_not_found") return null;
-  const servedAt = get(outer, "served_at");
-  if (typeof servedAt !== "bigint" || servedAt < 0n) return null;
-  const lastKept = servedAt + PEER_RECORD_RETENTION_BOUND_SECONDS;
+  const servedAt = servedAtOf(outer);
+  const retention = signedRetention(outer);
+  if (servedAt === null || retention === null) return null;
+  const lastKept = servedAt + peerRecordRetentionBound(retention);
   return nowSecs > lastKept ? lastKept : null;
 }
 
@@ -354,8 +386,12 @@ export async function verifyPeerReceipts(options: VerifyPeerReceiptsOptions): Pr
       const lastKept = answer === undefined ? null : retainedUntilPast(answer, options.outer, options.nowSecs);
       if (answer !== undefined && lastKept !== null) {
         expiredNumbers.push(attempt.n.toString());
+        const retention = signedRetention(options.outer);
+        const kept = get(options.outer, "retention_seconds") === undefined || get(options.outer, "retention_seconds") === null
+          ? `${String(retention)} s the entry keeps a receipt (no retention_seconds signed: an hour)`
+          : `${String(retention)} s the entry keeps a receipt (its signed retention_seconds)`;
         checks.push(expired(`${id}:fetch`, `${answer.error} at ${options.nowSecs}, after ${lastKept}, the last second the entry may hold this receipt's records `
-          + `(served_at + ${LONGEST_REQUEST_SECONDS} s for the longest request + ${ENTRY_RECEIPT_RETENTION_SECONDS} s the entry keeps a receipt + ${RECEIPT_CLOCK_MARGIN_SECONDS} s for clock difference): not checked`));
+          + `(served_at + ${LONGEST_REQUEST_SECONDS} s for the longest request + ${kept} + ${RECEIPT_CLOCK_MARGIN_SECONDS} s for clock difference): not checked`));
       } else {
         checks.push(fail(`${id}:fetch`, `the entry served no record of this attempt${answer === undefined ? "" : `: ${answer.error}`}`));
       }
@@ -424,6 +460,10 @@ async function checkPeer(
     tlsSpkiSha256: served.tls_spki_sha256,
     host: served.host,
     nowSecs: options.nowSecs,
+    // 1.8.0: the stack VM served the request at the outer receipt's signed served_at; a release superseded since
+    // still counts for it inside its window (release-list.ts `releaseListAt`).
+    // The stack VM's keyset signed its record then too: its not_after is held to served_at, not to now.
+    ...(servedAtOf(options.outer) === null ? {} : { releaseAt: servedAtOf(options.outer) as bigint, keysetAt: servedAtOf(options.outer) as bigint }),
     expectedRelayId: served.relay_id,
     quoteVerifier: options.quoteVerifier,
   });

@@ -138,13 +138,38 @@
  * that does not begin with its boundary line does not replay.
  *
  * `receipt --peers` and `check` always ask the entry for each `/peers/<n>` record, whatever the time (1.7.1). The entry
- * keeps a receipt and its peer records in memory for an hour after the answer ends. When it answers `404
- * receipt_not_found` for a record after the outer receipt's signed `served_at` plus PEER_RECORD_RETENTION_BOUND_SECONDS
- * (7 500 s: the longest request, the hour of retention and 300 s of clock difference), the line is `EXPIRED
- * peer:<n>:fetch` and, when no check failed, the verdict is `EXPIRED`, exit code 4: that attempt was not checked, and
- * nothing says it was changed. Inside that window the same answer is a FAIL, and so is every other answer. Only a
- * saved receipt gets there: `check <receipt id>` has no signed time before it holds the receipt, so a receipt the
- * entry no longer gives is a FAIL.
+ * keeps a receipt and its peer records for the outer receipt's signed `retention_seconds` after the answer ends (30
+ * days for an entry that persists its receipts, 1.8.0), and an hour, in memory, for a receipt without the member. When
+ * it answers `404 receipt_not_found` for a record after the outer receipt's signed `served_at` plus that retention plus
+ * 3 900 s (the longest request and 300 s of clock difference; 7 500 s in all without the member, as in 1.7.1), the line
+ * is `EXPIRED peer:<n>:fetch` and, when no check failed, the verdict is `EXPIRED`, exit code 4: that attempt was not
+ * checked, and nothing says it was changed. Inside that window the same answer is a FAIL, and so is every other
+ * answer. Only a saved receipt gets there: `check <receipt id>` has no signed time before it holds the receipt, so a
+ * receipt the entry no longer gives is a FAIL.
+ *
+ * An earlier boot's receipt (1.8.0, docs/design/persisted-receipts.md sections 6 and 7): when the receipt's
+ * `workload_keyset_digest` is not the keyset the live attestation of the origin shows, `receipt --origin` and `check`
+ * fetch `GET <origin>/v1/aci/receipts/<id>/attestation` with the key that made the request (GRAY_API_KEY): the boot
+ * report the entry stored for that boot. Its `keyset_digest` must be the receipt's and its nonce
+ * `hex(SHA-256("gray-lane-boot-report/v1" || keyset_digest))`. The report is verified as `--report --nonce` verifies
+ * one, with the quote checked against the collateral the boot stored, at its `collateral_check.checked_at`, or, when it
+ * stored none, against live collateral (the line says which), its keyset's `not_after` at the receipt's `served_at`,
+ * and its compose taken from the release list at `served_at`: a current release, or one in the list's `superseded`
+ * array whose `superseded_at` + 300 s is not before `served_at` (`release_at`). The live attestation must still pass.
+ * The transcript says `attested at boot, stored report` with the collateral's issue date and TCB status, and the
+ * machine output has `stored_attestation`. A `503 receipt_lookup_unavailable` (the entry's receipt store did not
+ * answer) is asked again after its `Retry-After` within `--wait`, for the receipt, its stored report and its peer
+ * records. A stack VM's record is checked against the stack list at the outer receipt's `served_at` the same way, and
+ * its keyset's `not_after` at that time too.
+ *
+ * The stored collateral's time (`collateral_window`): with A = `attested_at`, C = `collateral_check.checked_at`, S =
+ * `served_at` and N = now, A - 300 <= C <= N + 300 and C >= S - 2 days - 300 (the entry refreshes it daily). Online,
+ * `retention_window`: S >= N - (`retention_seconds` + 3 900). `collateralWindowCheck` says why.
+ *
+ * `--boot-report <file>` (1.8.0): the receipt's saved `/attestation` answer, for `receipt` (in place of `--origin` or
+ * `--report`) and `check --receipt`. Nothing is asked of the entry for it and no origin is attested, so a saved receipt
+ * stays checkable after the entry's retention or a move to another app id, with the signed release list kept beside
+ * it (`--allow`). `retention_window` does not apply and says so; `collateral_window` does.
  *
  * A receipt whose answer the client left (`served_as: client_left`, 1.7.1) commits to every event or body byte the
  * entry queued for the client. With `--response` bytes shorter than that, which do not end the answer by its protocol,
@@ -172,13 +197,14 @@ import type { PeerCertificate, TLSSocket } from "node:tls";
 import { adoptKeyset, parseAttestationReportText, parseReceiptText, RECEIPT_ARRIVAL_GRAY_API, reportKeysetValue, type RelayStackChanges, type SealedKeyset } from "@gray/attest";
 import { get, isObject, parseStrict, toJsonString, type Json, type JsonObject } from "@gray/json";
 import { isRewriteApi } from "@gray/lane";
-import { verifyAttestation, type AttestationVerification, type QuoteVerifier, type VerifyCheck } from "../attestation.ts";
+import { verifyAttestation, type AttestationVerification, type QuoteAppraisal, type QuoteVerifier, type VerifyCheck } from "../attestation.ts";
 import { LANE_ORIGIN_HEADER, readLaneOrigin } from "../lane-origin.ts";
 import { verifyResponseReceiptText, type ReceiptCheck, type ReceiptProtocol, type StackReceiptSummary, type TemplateText } from "../receipt.ts";
 import type { PeerReleaseList } from "../peer.ts";
-import { peerNumbersToFetch, readPeerAnswerText, verifyPeerReceipts, withPeerTie, type PeerAnswer, type PeerAnswerError, type PeerReceiptsVerification } from "../peer-receipt.ts";
+import { ENTRY_RECEIPT_RETENTION_SECONDS, PEER_RECORD_RETENTION_MARGIN_SECONDS, RECEIPT_CLOCK_MARGIN_SECONDS, peerNumbersToFetch, peerRecordRetentionBound, readPeerAnswerText, verifyPeerReceipts, withPeerTie, type PeerAnswer, type PeerAnswerError, type PeerReceiptsVerification } from "../peer-receipt.ts";
 import { isStackRelayImage, STACK_RELAY_ID_PATTERN, type StackBootResult } from "../stack-boot.ts";
-import { MAX_RELEASE_LIST_BYTES, osImageProvenance, readReleaseListText, type ReleaseList } from "../release-list.ts";
+import { MAX_RELEASE_LIST_BYTES, RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS, osImageProvenance, readReleaseListText, releaseListAt, type ReleaseList } from "../release-list.ts";
+import { bootReportNonce, collateralIssueDate, readStoredAttestationText, type StoredAttestation, type StoredCollateral } from "../stored-attestation.ts";
 import { releaseFreshnessLocation } from "../release-freshness.ts";
 import { DEFAULT_ORIGIN, knownEntry, type KnownEntry } from "./entries.ts";
 import { fetchThroughTunnel, TunnelRefusedError, tunnelOrigin } from "./tunnel.ts";
@@ -376,7 +402,8 @@ function usage(): string {
     "           [--accept-os-unpinned] [--provider <deployment id>] [--provider-image <image ref>]",
     "           [--ca <pem>] [--nonce <64 hex>] [--now <unix>] [--pccs <url>] [--verifier-module <file>]",
     "       gray-lane-verify receipt <receipt.json> --request <body file>",
-    "           (--origin <lane origin> [--lane-origin <url>] | --report <report.json> --nonce <64 hex>)",
+    "           (--origin <lane origin> [--lane-origin <url>] | --report <report.json> --nonce <64 hex>",
+    "            | --boot-report <file>)",
     "           --allow <release-list.json> --release-key <64 hex> [--accept-os-unpinned]",
     "           [--allow-freshness <file> --freshness-key <64 hex>]",
     "           [--response <raw response file>] [--templates <texts.json>]",
@@ -384,6 +411,7 @@ function usage(): string {
     "           [--peers --allow-stack <stack release-list.json> [--allow-stack-freshness <file>] [--wait <seconds>]]",
     "           [--ca <pem>] [--now <unix>] [--pccs <url>] [--verifier-module <file>]",
     "       gray-lane-verify check (<receipt id> | --receipt <receipt.json>) --request <body file>",
+    "           [--boot-report <file>, with --receipt]",
     "           [--origin <entry origin>] [--lane-origin <url>] [--response <raw response file>] [--wait <seconds>]",
     "           [--templates <texts.json>] [--protocol <...>] [--accept-os-unpinned]",
     "           [--allow <file or URL> --release-key <64 hex> [--allow-freshness <file or URL> --freshness-key <64 hex>]]",
@@ -399,8 +427,9 @@ function usage(): string {
     "  --response <file>       the raw bytes you received (SSE framing included): also checks the answer",
     `  --origin <url>          the entry you sent the request to (default ${DEFAULT_ORIGIN})`,
     "  --lane-origin <url>     the answer's x-gray-lane-origin header, when it had one",
-    "  --wait <seconds>        how long to keep asking while the entry answers 503 receipt_pending, or",
-    "                          502 peer_receipt_unavailable for a provider VM's record (default 30, in all)",
+    "  --wait <seconds>        how long to keep asking while the entry answers 503 receipt_pending or",
+    "                          receipt_lookup_unavailable, or 502 peer_receipt_unavailable for a provider",
+    "                          VM's record (default 30, in all)",
     `  For ${DEFAULT_ORIGIN} the release lists are fetched from where Gray publishes them and accepted`,
     "  only under the release and freshness keys built into this tool (--version names its source commit).",
     "  For another origin pass --allow, --release-key and, for a provider's VM, --allow-stack.",
@@ -434,8 +463,19 @@ function usage(): string {
     "  --allow-stack-freshness <file>  its freshness document, under the same --freshness-key. Without it, when a",
     "                          freshness key is pinned, the .freshness.json beside --allow-stack is read, and",
     "                          one that cannot be read leaves the list current for a day after its issued_at",
-    "  --wait <seconds>        with --peers: how long to keep asking while the entry answers 502",
-    "                          peer_receipt_unavailable for a VM's record (default 30)",
+    "  --wait <seconds>        with --origin: how long to keep asking while the entry answers 503",
+    "                          receipt_lookup_unavailable for an earlier boot's stored report, or, with",
+    "                          --peers, 502 peer_receipt_unavailable for a VM's record (default 30)",
+    "",
+    "  A receipt whose keyset is not the one the origin attests now was signed by an earlier boot: receipt",
+    "  --origin and check then verify the boot report the entry stored for it (GRAY_API_KEY reads it)",
+    "  and print 'attested at boot, stored report' with the collateral's issue date and TCB status.",
+    "  --boot-report <file>    receipt, and check with --receipt: the receipt's saved",
+    "                          GET /v1/aci/receipts/<id>/attestation answer, used instead of asking the",
+    "                          entry; no origin is attested. With the receipt and the signed release list",
+    "                          (--allow, a file) it checks a receipt after the entry's 30 days or after",
+    "                          the entry moved to another app id. The stored collateral must still have",
+    "                          been checked at most two days before the receipt was served",
     "",
     "  Plain PASS requires both a pinned compose hash and a pinned OS image.",
     "  --ca <pem> replaces Node's default trust store; it is not added to it.",
@@ -446,8 +486,9 @@ function usage(): string {
     "            3 (receipt, check) VALID, NOT END TO END: the receipt is genuine, and the request",
     "            arrived through Gray's API, so your connection did not end in the attested VM,",
     "            4 (receipt --peers, check) EXPIRED: no check failed, and the entry no longer holds",
-    "            a provider VM's record: asked after the saved receipt's served_at + 7500 s",
-    "            (the entry keeps records for an hour after the answer ends), so it was not checked,",
+    "            a provider VM's record: asked after the saved receipt's served_at + its signed",
+    "            retention_seconds + 3900 s (an hour of retention on a receipt without the member,",
+    "            7500 s in all), so it was not checked,",
     "            5 (receipt, check) PARTIAL: no check failed, and the entry recorded served_as:",
     "            client_left: the --response bytes are shorter than what it queued for the client",
     "            and do not end the answer, so the response digest was not recomputed",
@@ -807,16 +848,45 @@ async function loadQuoteVerifier(args: ParsedArgs, nowSecs: bigint): Promise<Quo
     const { dcapQuoteVerifier } = await import("./dcap.ts");
     return dcapQuoteVerifier({ pccsUrl: args.flags.get("pccs"), nowSecs: () => Number(nowSecs) });
   }
-  let imported: { readonly quoteVerifier?: unknown };
+  return (await importVerifierModule(modulePath)).quoteVerifier;
+}
+
+/** What `--verifier-module` exports: `quoteVerifier`, and optionally `collateralQuoteVerifier` in `../dcap.ts`'s shape. */
+interface VerifierModule {
+  readonly quoteVerifier: QuoteVerifier;
+  readonly collateralQuoteVerifier?: (options: { readonly collateral: (quote: Uint8Array) => unknown; readonly nowSecs?: () => number }) => QuoteVerifier;
+}
+
+async function importVerifierModule(modulePath: string): Promise<VerifierModule> {
+  let imported: { readonly quoteVerifier?: unknown; readonly collateralQuoteVerifier?: unknown };
   try {
-    imported = (await import(pathToFileURL(resolve(modulePath)).href)) as { readonly quoteVerifier?: unknown };
+    imported = (await import(pathToFileURL(resolve(modulePath)).href)) as { readonly quoteVerifier?: unknown; readonly collateralQuoteVerifier?: unknown };
   } catch (error) {
     throw new UsageError(`cannot load quote verifier module ${modulePath}: ${messageOf(error)}`);
   }
   if (typeof imported.quoteVerifier !== "function") {
     throw new UsageError(`${modulePath} does not export a quoteVerifier function`);
   }
-  return imported.quoteVerifier as QuoteVerifier;
+  return {
+    quoteVerifier: imported.quoteVerifier as QuoteVerifier,
+    ...(typeof imported.collateralQuoteVerifier === "function" ? { collateralQuoteVerifier: imported.collateralQuoteVerifier as NonNullable<VerifierModule["collateralQuoteVerifier"]> } : {}),
+  };
+}
+
+/**
+ * 1.8.0: the quote verifier for an earlier boot's stored report. With the collateral the boot stored, dcap-qvl with that
+ * collateral at the boot's `checked_at` (`../dcap.ts` `collateralQuoteVerifier`); without it, the live path. With
+ * `--verifier-module`, the module's `collateralQuoteVerifier` when it exports one, else its `quoteVerifier`.
+ */
+async function storedQuoteVerifier(args: ParsedArgs, collateral: StoredCollateral | null, checkedAt: bigint | null, nowSecs: bigint): Promise<QuoteVerifier> {
+  const modulePath = args.flags.get("verifier-module");
+  if (collateral === null || checkedAt === null) return loadQuoteVerifier(args, nowSecs);
+  if (modulePath !== undefined) {
+    const module = await importVerifierModule(modulePath);
+    return module.collateralQuoteVerifier === undefined ? module.quoteVerifier : module.collateralQuoteVerifier({ collateral: () => collateral, nowSecs: () => Number(checkedAt) });
+  }
+  const { storedCollateralQuoteVerifier } = await import("../dcap.ts");
+  return storedCollateralQuoteVerifier(collateral, checkedAt);
 }
 
 function normalizeOrigin(text: string): URL {
@@ -977,7 +1047,7 @@ interface AttestedKeyset {
 }
 
 async function receiptCommand(args: ParsedArgs): Promise<number> {
-  assertFlags(args, ["request", "origin", "lane-origin", "report", "nonce", "allow", "accept-os-unpinned", "release-key", "allow-freshness", "freshness-key", "response", "templates", "protocol", "ca", "now", "pccs", "verifier-module", "peers", "allow-stack", "allow-stack-freshness", "wait"]);
+  assertFlags(args, ["request", "origin", "lane-origin", "report", "nonce", "boot-report", "allow", "accept-os-unpinned", "release-key", "allow-freshness", "freshness-key", "response", "templates", "protocol", "ca", "now", "pccs", "verifier-module", "peers", "allow-stack", "allow-stack-freshness", "wait"]);
   if (args.positional.length !== 1) throw new UsageError("receipt needs exactly one receipt file");
   const receiptPath = args.positional[0] as string;
   const receiptText = readText(receiptPath, "receipt");
@@ -985,8 +1055,10 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
   const pins = readPinFlags(args, "receipt");
   const sharedOrigin = args.flags.has("origin") ? normalizeOrigin(requiredFlag(args, "origin")) : null;
   const reportPath = args.flags.get("report");
-  if ((sharedOrigin === null) === (reportPath === undefined)) {
-    throw new UsageError("receipt needs exactly one attested source: --origin <lane origin> or --report <report.json>");
+  // 1.8.0: --boot-report, a saved /attestation answer: the receipt's own boot, no origin attested.
+  const bootReportPath = args.flags.get("boot-report");
+  if ([sharedOrigin !== null, reportPath !== undefined, bootReportPath !== undefined].filter(Boolean).length !== 1) {
+    throw new UsageError("receipt needs exactly one attested source: --origin <lane origin>, --report <report.json>, or --boot-report <the receipt's saved /attestation answer>");
   }
   // ER6: the replica that served is where the receipt's keyset is attested and its peer records are asked for.
   const laneOrigin = readLaneOriginFlag(args, sharedOrigin);
@@ -997,36 +1069,42 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
   if (reportPath !== undefined && !args.flags.has("nonce")) {
     throw new UsageError("receipt --report needs --nonce <64 hex>: the nonce the report was issued for");
   }
+  if (bootReportPath !== undefined && args.flags.has("nonce")) {
+    throw new UsageError("receipt --boot-report reads the nonce from the saved answer; --nonce is only for --report");
+  }
   if (origin !== null && args.flags.has("nonce")) {
     throw new UsageError("receipt --origin generates a fresh nonce; --nonce is only for --report");
   }
   const peerFlags = readPeerFlags(args, origin, pins);
+  const waitS = args.flags.has("wait") ? parseWait(args.flags.get("wait") as string) : DEFAULT_WAIT_S;
   const ca = args.flags.has("ca") ? readText(args.flags.get("ca") as string, "CA certificate") : undefined;
   const nowSecs = args.flags.has("now") ? parseUnixSeconds(args.flags.get("now") as string) : nowSeconds();
   if (pins.releaseKey === null) throw new UsageError("--allow needs --release-key <64 hex>: the signed release list Gray publishes");
   const pinned = await loadReleaseList(pins.allowPath, pins.releaseKey, nowSecs, pins);
   const release = pinned.list;
-  const quoteVerifier = await loadQuoteVerifier(args, nowSecs);
-  const attested = origin !== null
-    ? await attestFromOrigin(origin, release, ca, nowSecs, quoteVerifier)
-    : await attestFromReport(parseReportText(readText(reportPath as string, "attestation report"), "the attestation report"), parseNonce(args.flags.get("nonce") as string), release, nowSecs, quoteVerifier);
-
-  const sealed = attested.sealed;
-  const attestedOk = attestedOkFrom(attested, pins);
   const laneLine = laneOrigin === null || sharedOrigin === null ? "" : `lane_origin: ${laneOrigin.origin} (${LANE_ORIGIN_HEADER}, a replica of ${sharedOrigin.origin})\n`;
-  if (!attestedOk || sealed === null) {
-    out(`gray-lane-verify receipt ${receiptPath}\n`);
-    out(`${pinned.line}\n`);
-    out(laneLine);
-    printChecks(attested.verification.checks);
-    printChecks([{
-      id: "keyset_attestation",
-      status: "fail",
-      detail: attestationFailure(attested.verification, pins, sealed?.digest ?? null),
-    }]);
-    out("VERDICT: FAIL\n");
-    out(`${toJsonString(withLaneOrigin(receiptMachine({ attested, attestedOk, pins, receipt: null }), laneOrigin))}\n`);
-    return 1;
+  const quoteVerifier = await loadQuoteVerifier(args, nowSecs);
+  // The live keyset: attested at --origin, or the --report given. None with --boot-report.
+  let live: AttestedKeyset | null = null;
+  if (bootReportPath === undefined) {
+    const attested = origin !== null
+      ? await attestFromOrigin(origin, release, ca, nowSecs, quoteVerifier)
+      : await attestFromReport(parseReportText(readText(reportPath as string, "attestation report"), "the attestation report"), parseNonce(args.flags.get("nonce") as string), release, nowSecs, quoteVerifier);
+    if (!attestedOkFrom(attested, pins) || attested.sealed === null) {
+      out(`gray-lane-verify receipt ${receiptPath}\n`);
+      out(`${pinned.line}\n`);
+      out(laneLine);
+      printChecks(attested.verification.checks);
+      printChecks([{
+        id: "keyset_attestation",
+        status: "fail",
+        detail: attestationFailure(attested.verification, pins, attested.sealed?.digest ?? null),
+      }]);
+      out("VERDICT: FAIL\n");
+      out(`${toJsonString(withLaneOrigin(receiptMachine({ attested, attestedOk: false, pins, receipt: null }), laneOrigin))}\n`);
+      return 1;
+    }
+    live = attested;
   }
 
   const receivedBody = readBytes(requestPath, "request body");
@@ -1034,14 +1112,43 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
   const templates = args.flags.has("templates") ? loadTemplates(args.flags.get("templates") as string) : [];
   const protocol = args.flags.has("protocol") ? parseProtocol(args.flags.get("protocol") as string) : undefined;
 
+  // 1.8.0: a receipt of an earlier boot is verified under the keyset of the boot report the entry stored for it, read
+  // from the entry or from the file --boot-report names.
+  const stored = await storedFor({
+    receiptText,
+    live,
+    bootReportPath: bootReportPath ?? null,
+    origin,
+    apiKey: peerFlags?.apiKey ?? apiKeyFromEnvironment(),
+    ca,
+    waitS,
+    list: release,
+    pins,
+    args,
+    nowSecs,
+  });
+  if (stored !== null && !stored.ok) {
+    out(`gray-lane-verify receipt ${receiptPath}\n`);
+    out(`${pinned.line}\n`);
+    out(laneLine);
+    printChecks(stored.checks);
+    out("VERDICT: FAIL\n");
+    const machine = live === null ? { command: "receipt", receipt_id: null, keyset_digest: null } : withLaneOrigin(receiptMachine({ attested: live, attestedOk: true, pins, receipt: null }), laneOrigin);
+    out(`${toJsonString({ ...machine, ok: false, checks: stored.checks.map(checkValue), ...(stored.machine === null ? {} : { stored_attestation: stored.machine }) })}\n`);
+    return 1;
+  }
+  const used = stored === null ? (live as AttestedKeyset) : stored.attested;
+  const attestedOk = true;
+  const keyset = used.sealed as SealedKeyset;
+
   // The receipt key must be the one the verified report bound: pass the sealed keyset and its digest
   // as the independent expectations (F-02, F-03). S55: and its relay image the attested boot's.
-  const relayImage = attestedRelayImage(attested.verification.stackBoot);
+  const relayImage = attestedRelayImage(used.verification.stackBoot);
   const receipt = await verifyResponseReceiptText(receiptText, {
     receivedBody,
     templates,
-    keyset: sealed,
-    expectedKeysetDigest: sealed.digest,
+    keyset,
+    expectedKeysetDigest: keyset.digest,
     ...(relayImage === undefined ? {} : { expectedRelayImage: relayImage }),
     ...(responseBytes === undefined ? {} : { responseBytes }),
     ...(protocol === undefined ? {} : { protocol }),
@@ -1050,7 +1157,8 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
   const peers = peerFlags === null || origin === null
     ? null
     : await peerChecks({
-        flags: peerFlags,
+        // What the stored report's fetch left of --wait.
+        flags: { ...peerFlags, waitS: Math.max(peerFlags.waitS - (stored?.waitedS ?? 0), 0) },
         origin,
         receiptText,
         receipt,
@@ -1063,23 +1171,31 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
       });
 
   const ok = receipt.ok && (peers === null || peers.ok);
-  const outcome = receiptOutcome(receipt, !peersFailed(peers), peersExpired(peers), attested.verification.osPinned);
+  const outcome = receiptOutcome(receipt, !peersFailed(peers), peersExpired(peers), used.verification.osPinned);
   const shown = joinedReceipt(receipt, peers);
+  const note = stored === null ? "" : STORED_NOTE;
   out(`gray-lane-verify receipt ${receiptPath}\n`);
   out(`${pinned.line}\n`);
   out(laneLine);
   printChecks([{
     id: "keyset_attestation",
     status: "pass",
-    detail: `${sealed.digest}; compose ${attested.verification.composeHash ?? "(unpinned)"}${attested.verification.osPinned ? "" : " (OS unpinned, accepted)"}`,
+    detail: `${keyset.digest}; compose ${used.verification.composeHash ?? "(unpinned)"}${used.verification.osPinned ? "" : " (OS unpinned, accepted)"}${note}`,
   }]);
+  if (stored !== null) {
+    printChecks(stored.checks);
+    for (const line of stored.lines) out(line);
+  }
   printChecks(shown.checks);
   if (peers !== null) printChecks(peers.checks);
   out(`VERDICT: ${outcome.verdict}\n`);
-  const machine = withLaneOrigin(receiptMachine({ attested, attestedOk, pins, receipt: shown }), laneOrigin);
+  const machine: JsonObject = { ...withLaneOrigin(receiptMachine({ attested: used, attestedOk, pins, receipt: shown, note, extra: stored?.checks ?? [] }), laneOrigin), ...(stored === null ? {} : { stored_attestation: stored.machine }) };
   out(`${toJsonString(peers === null ? { ...machine, ...partialMachine(receipt) } : { ...machine, ok: machine.ok === true && peers.ok, peers: peersMachine(peers), ...expiredMachine(peers), ...partialMachine(receipt) })}\n`);
   return ok ? 0 : outcome.code;
 }
+
+/** 1.8.0: what the `keyset_attestation` line adds for a keyset an earlier boot's stored report shows. */
+const STORED_NOTE = "; attested at boot, stored report";
 
 /** `receipt` and `check`'s verdict for a receipt that verified, read with the other checks (`others`). */
 export const NOT_END_TO_END_VERDICT = "VALID, NOT END TO END: arrived through Gray's API";
@@ -1179,7 +1295,8 @@ function readPeerFlags(args: ParsedArgs, origin: URL | null, pins: PinFlags): Pe
   const stackFreshness = args.flags.get("allow-stack-freshness");
   if (!args.flags.has("peers")) {
     if (stackPath !== undefined || stackFreshness !== undefined) throw new UsageError("--allow-stack and --allow-stack-freshness are only meaningful with --peers");
-    if (args.flags.has("wait")) throw new UsageError("--wait is only meaningful with --peers: it bounds the asks for a provider VM's records");
+    // 1.8.0: with --origin, --wait also bounds the asks for an earlier boot's stored report.
+    if (args.flags.has("wait") && origin === null) throw new UsageError("--wait is only meaningful with --origin: it bounds the asks to the entry for an earlier boot's stored report and, with --peers, a provider VM's records");
     return null;
   }
   if (origin === null) throw new UsageError("receipt --peers needs --origin <lane origin>: the entry serves each peer attempt's records for the receipt");
@@ -1255,9 +1372,10 @@ async function peerChecks(input: {
     try {
       for (;;) {
         fetched = await net.getWithKey(url, input.flags.apiKey, input.ca, MAX_PEER_ANSWER_BYTES);
-        // The stack VM has not signed its receipt yet (receipt-route.ts), or the entry could not reach it: ask again.
-        // A receipt that does not match (peer_receipt_mismatch), and every other answer, is taken as it is.
-        if (fetched.status !== 502 || exactErrorCode(fetched.text) !== PEER_RECEIPT_UNAVAILABLE) break;
+        // The stack VM has not signed its receipt yet (receipt-route.ts), or the entry could not reach it, or (1.8.0) the
+        // entry's receipt store did not answer: ask again. A receipt that does not match (peer_receipt_mismatch), and
+        // every other answer, is taken as it is.
+        if (!askAgain(fetched)) break;
         const leftS = input.flags.waitS - waitedS;
         if (leftS <= 0) break;
         const retryS = Math.min(retryAfterSeconds(fetched.headers?.["retry-after"]), leftS);
@@ -1272,7 +1390,7 @@ async function peerChecks(input: {
     if (fetched.status !== 200) {
       // The status and the exact code: verifyPeerReceipts reads a 404 receipt_not_found past the retention as expired.
       const code = exactErrorCode(fetched.text);
-      const still = fetched.status === 502 && code === PEER_RECEIPT_UNAVAILABLE ? `, still after ${String(waitedHereS)} s: ask again later, or give --wait more seconds` : "";
+      const still = askAgain(fetched) ? `, still after ${String(waitedHereS)} s: ask again later, or give --wait more seconds` : "";
       answers.set(n.toString(), { error: `${url.pathname} answered ${fetched.status}${errorCodeOf(fetched.text)}${still}`, status: fetched.status, code });
       continue;
     }
@@ -1291,8 +1409,14 @@ async function peerChecks(input: {
   });
 }
 
-/** The entry's 502 for a record of a stack VM it could not get yet (receipt-route.ts), the one answer asked again. */
+/** The entry's 502 for a record of a stack VM it could not get yet (receipt-route.ts), an answer asked again. */
 const PEER_RECEIPT_UNAVAILABLE = "peer_receipt_unavailable";
+
+/** A `/peers/<n>` answer asked again within --wait: 502 peer_receipt_unavailable, or 503 receipt_lookup_unavailable. */
+function askAgain(fetched: FetchedText): boolean {
+  const code = exactErrorCode(fetched.text);
+  return (fetched.status === 502 && code === PEER_RECEIPT_UNAVAILABLE) || (fetched.status === 503 && code === RECEIPT_LOOKUP_UNAVAILABLE);
+}
 
 /** The `error.code` string of an ACI error body (`{error: {code}}`) exactly as sent, or null. */
 function exactErrorCode(text: string): string | null {
@@ -1410,6 +1534,309 @@ function sealedFromReport(report: Json): SealedKeyset | null {
   return adoptKeyset(value);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// 1.8.0: a receipt of an earlier boot, verified with the boot report the entry stored for it
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * The earlier boot's report a receipt is verified with: the file `--boot-report` names (the receipt's own boot,
+ * whatever runs now), else, when the receipt names a keyset other than the live one, the entry's `/attestation` at
+ * `origin`. Null when neither applies: the receipt is the live boot's, or `--report` attested it.
+ */
+async function storedFor(input: {
+  readonly receiptText: string;
+  readonly live: AttestedKeyset | null;
+  readonly bootReportPath: string | null;
+  readonly origin: URL | null;
+  readonly apiKey: string | null;
+  readonly ca: string | undefined;
+  readonly waitS: number;
+  readonly list: ReleaseList;
+  readonly pins: PinFlags;
+  readonly args: ParsedArgs;
+  readonly nowSecs: bigint;
+}): Promise<StoredBoot | null> {
+  const common = { list: input.list, pins: input.pins, args: input.args, nowSecs: input.nowSecs };
+  if (input.bootReportPath !== null) {
+    const text = readText(input.bootReportPath, "boot report");
+    const older = receiptBootOf(input.receiptText);
+    if (older === null) {
+      const detail = "the receipt does not read as a receipt with an id, a keyset digest and a served_at, so no boot report can be matched to it";
+      return { ok: false, checks: [{ id: "stored_attestation", status: "fail", detail }], lines: [], machine: null, waitedS: 0 };
+    }
+    return storedBootAttestation({ source: { kind: "file", path: input.bootReportPath, text }, older, ...common });
+  }
+  const liveDigest = input.live?.sealed?.digest;
+  if (input.origin === null || liveDigest === undefined) return null;
+  const older = olderBootOf(input.receiptText, liveDigest);
+  if (older === null) return null;
+  return storedBootAttestation({ source: { kind: "fetch", origin: input.origin, liveDigest, apiKey: input.apiKey, ca: input.ca, waitS: input.waitS }, older, ...common });
+}
+
+/** The boot a receipt names: its id, keyset, signed time and signed retention. */
+interface OlderBoot {
+  readonly receiptId: string;
+  readonly keysetDigest: string;
+  readonly servedAt: bigint;
+  /** The receipt's signed `retention_seconds`, null when it carries none (an hour in the entry's memory). */
+  readonly retentionSeconds: bigint | null;
+}
+
+/** The receipt's id, keyset, `served_at` and `retention_seconds`; null when it does not read as a receipt with them. */
+function receiptBootOf(receiptText: string): OlderBoot | null {
+  const parsed = parseReceiptText(receiptText);
+  if (!parsed.ok) return null;
+  const digest = get(parsed.value, "workload_keyset_digest");
+  const receiptId = get(parsed.value, "receipt_id");
+  const servedAt = get(parsed.value, "served_at");
+  const retention = get(parsed.value, "retention_seconds");
+  if (typeof digest !== "string" || typeof receiptId !== "string" || !RECEIPT_ID_FORM.test(receiptId) || typeof servedAt !== "bigint" || servedAt < 0n) return null;
+  return { receiptId, keysetDigest: digest, servedAt, retentionSeconds: typeof retention === "bigint" ? retention : null };
+}
+
+/** The receipt's boot when it names a keyset other than `liveDigest`; null otherwise. */
+function olderBootOf(receiptText: string, liveDigest: string): OlderBoot | null {
+  const boot = receiptBootOf(receiptText);
+  return boot === null || boot.keysetDigest === liveDigest ? null : boot;
+}
+
+/** Where an earlier boot's report comes from: the entry's `/attestation` (online) or a saved answer (`--boot-report`). */
+type StoredSource =
+  | { readonly kind: "fetch"; readonly origin: URL; readonly liveDigest: string; readonly apiKey: string | null; readonly ca: string | undefined; readonly waitS: number }
+  | { readonly kind: "file"; readonly path: string; readonly text: string };
+
+/** The longest a boot's stored collateral may have been checked before the receipt was served: a missed daily refresh. */
+const STORED_COLLATERAL_MAX_AGE_SECONDS = 2n * 86_400n;
+
+/**
+ * Item (a) and (b) of the stored collateral's time (PR #1129 review), with A = `attested_at`, C =
+ * `collateral_check.checked_at`, S = the receipt's `served_at`, N = now and the 300 s clock margin:
+ *
+ *   (a) A - 300 <= C <= N + 300, and (b) C >= S - 2 days - 300.
+ *
+ * Why. The collateral is Intel-signed (TCB info, QE identity, CRLs under Intel's root), so no one can forge it; what
+ * an entry, or anyone serving `/attestation`, can do is choose an older genuine one, from before Intel revoked the
+ * platform or downgraded its TCB, and date the check accordingly. dcap-qvl takes C as its clock, so a backdated C
+ * would make that old collateral current again. The entry refreshes the boot's collateral daily (same report, new
+ * collateral and C), so (b) ties C to at most two days before the receipt was served, one missed refresh tolerated,
+ * and (a) keeps C within the boot's life up to now. Online, `retention_window` ((c), S >= N - (retention_seconds +
+ * 3 900)) ties S to the receipt's signed retention, so together a platform revocation older than the retention plus
+ * two days and the margins cannot be hidden by backdating. A saved report (`--boot-report`) is checked later by
+ * design, so (c) does not apply there and the transcript says so; (a) and (b) still do.
+ */
+function collateralWindowCheck(attestedAt: bigint, checkedAt: bigint, servedAt: bigint, nowSecs: bigint): CheckLine {
+  const margin = RECEIPT_CLOCK_MARGIN_SECONDS;
+  const earliest = servedAt - STORED_COLLATERAL_MAX_AGE_SECONDS - margin;
+  const at = `collateral checked at ${String(checkedAt)}`;
+  if (checkedAt < attestedAt - margin) return { id: "collateral_window", status: "fail", detail: `${at}, before the boot was attested at ${String(attestedAt)} (with ${String(margin)} s for clocks)` };
+  if (checkedAt > nowSecs + margin) return { id: "collateral_window", status: "fail", detail: `${at}, after now ${String(nowSecs)} (with ${String(margin)} s for clocks)` };
+  if (checkedAt < earliest) {
+    return {
+      id: "collateral_window",
+      status: "fail",
+      detail: `${at}, more than two days before the receipt was served at ${String(servedAt)} (the earliest taken is ${String(earliest)}; the entry refreshes the collateral daily): an older collateral may hide a later revocation`,
+    };
+  }
+  return { id: "collateral_window", status: "pass", detail: `${at}: after the boot was attested at ${String(attestedAt)}, not after now, and at most two days before the receipt was served at ${String(servedAt)}` };
+}
+
+/** (c), online only: the receipt was served within its signed retention of now. */
+/**
+ * The most of a receipt's signed `retention_seconds` the online stored-boot window counts: the entry's own 30 days
+ * (docs/design/persisted-receipts.md section 3). The member is signed by the receipt's own keyset, so a hostile origin on
+ * a since-revoked platform could sign 2^32 - 1 (136 years) and backdate `served_at` and the collateral's check to before
+ * the revocation; capped, the window ends 30 days and 3 900 s after serving whatever the receipt says.
+ */
+export const MAX_STORED_RETENTION_SECONDS = 2_592_000n;
+
+function retentionWindowCheck(older: OlderBoot, source: StoredSource, nowSecs: bigint): CheckLine {
+  if (source.kind === "file") {
+    return { id: "retention_window", status: "skip", detail: `not checked: the boot report is a saved file (--boot-report ${transcriptText(source.path)}), checked after the entry's retention by design` };
+  }
+  const signed = older.retentionSeconds;
+  const capped = signed !== null && signed > MAX_STORED_RETENTION_SECONDS;
+  const retention = signed === null ? ENTRY_RECEIPT_RETENTION_SECONDS : capped ? MAX_STORED_RETENTION_SECONDS : signed;
+  const bound = peerRecordRetentionBound(retention);
+  const earliest = nowSecs - bound;
+  const said = signed === null
+    ? `${String(retention)} s (no retention_seconds signed: an hour)`
+    : capped
+      ? `${String(retention)} s (its signed retention_seconds ${String(signed)}, counted at most ${String(MAX_STORED_RETENTION_SECONDS)} s)`
+      : `${String(retention)} s (its signed retention_seconds)`;
+  return older.servedAt >= earliest
+    ? { id: "retention_window", status: "pass", detail: `served at ${String(older.servedAt)}, within ${said} + ${String(PEER_RECORD_RETENTION_MARGIN_SECONDS)} s of now ${String(nowSecs)}` }
+    : { id: "retention_window", status: "fail", detail: `served at ${String(older.servedAt)}, before ${String(earliest)}: more than ${said} + ${String(PEER_RECORD_RETENTION_MARGIN_SECONDS)} s before now ${String(nowSecs)}; check it with its saved /attestation answer (--boot-report)` };
+}
+
+/** The entry's 503 when its receipt store (R2, through the bridge) did not answer (persisted-receipts.md section 6). */
+const RECEIPT_LOOKUP_UNAVAILABLE = "receipt_lookup_unavailable";
+/** The largest `/attestation` answer read: a report and its collateral (about 20 KB), with room. */
+const MAX_STORED_ANSWER_BYTES = MAX_REPORT_BYTES + 256 * 1024;
+
+type StoredBoot =
+  | {
+    readonly ok: true;
+    /** The stored report's verification and the keyset it binds: what the receipt is verified under. */
+    readonly attested: AttestedKeyset;
+    readonly checks: readonly CheckLine[];
+    readonly lines: readonly string[];
+    readonly machine: JsonObject;
+    readonly attestedAt: bigint;
+    readonly waitedS: number;
+  }
+  | { readonly ok: false; readonly checks: readonly CheckLine[]; readonly lines: readonly string[]; readonly machine: JsonObject | null; readonly waitedS: number };
+
+/**
+ * `GET <origin>/v1/aci/receipts/<id>/attestation` with the key that made the request, asked again after a
+ * `503 receipt_lookup_unavailable`'s `Retry-After` while `waitS` lasts.
+ */
+async function fetchStoredAttestation(url: URL, apiKey: string, ca: string | undefined, waitS: number): Promise<{ readonly ok: true; readonly text: string; readonly waitedS: number } | { readonly ok: false; readonly detail: string; readonly waitedS: number }> {
+  const sleep = net.sleep ?? (NODE_NET.sleep as NonNullable<CliNet["sleep"]>);
+  let waitedS = 0;
+  for (;;) {
+    let fetched: FetchedText;
+    try {
+      fetched = await net.getWithKey(url, apiKey, ca, MAX_STORED_ANSWER_BYTES);
+    } catch (error) {
+      return { ok: false, detail: `cannot fetch ${url.pathname}: ${messageOf(error)}`, waitedS };
+    }
+    if (fetched.status === 200) return { ok: true, text: fetched.text, waitedS };
+    if (fetched.status === 503 && exactErrorCode(fetched.text) === RECEIPT_LOOKUP_UNAVAILABLE) {
+      const leftS = waitS - waitedS;
+      if (leftS > 0) {
+        const retryS = Math.min(retryAfterSeconds(fetched.headers?.["retry-after"]), leftS);
+        await sleep(retryS * 1000);
+        waitedS += retryS;
+        continue;
+      }
+      return { ok: false, detail: `${url.pathname} still answers 503 ${RECEIPT_LOOKUP_UNAVAILABLE} after ${String(waitedS)} s: the entry's receipt store did not answer; ask again later, or give --wait more seconds`, waitedS };
+    }
+    return { ok: false, detail: `${url.pathname} answered ${String(fetched.status)}${errorCodeOf(fetched.text)}`, waitedS };
+  }
+}
+
+/**
+ * Whether the release list at the receipt's `served_at` takes the stored report's compose (`releaseListAt`): a current
+ * release, or a superseded one whose window covers `served_at`. A line for the transcript, null without a compose.
+ */
+function releaseAtCheck(list: ReleaseList, composeHash: string | null, servedAt: bigint): { readonly check: CheckLine; readonly supersededAt: bigint | null } | null {
+  if (composeHash === null) return null;
+  const hash = safeToken(composeHash);
+  if (list.composeHashes.includes(composeHash)) {
+    return { check: { id: "release_at", status: "pass", detail: `compose ${hash} is a current release of the list` }, supersededAt: null };
+  }
+  const superseded = (list.superseded ?? []).find((entry) => entry.compose_hash === composeHash);
+  if (superseded === undefined) {
+    return { check: { id: "release_at", status: "fail", detail: `compose ${hash} is not in the release list, current or superseded` }, supersededAt: null };
+  }
+  const until = superseded.superseded_at + RELEASE_LIST_DEFAULT_MAX_FUTURE_SECONDS;
+  const window = `superseded at ${String(superseded.superseded_at)}, accepted until ${String(until)}`;
+  return servedAt <= until
+    ? { check: { id: "release_at", status: "pass", detail: `compose ${hash} accepted at the receipt's served_at ${String(servedAt)}: ${window}` }, supersededAt: superseded.superseded_at }
+    : { check: { id: "release_at", status: "fail", detail: `compose ${hash} not accepted at the receipt's served_at ${String(servedAt)}: ${window}` }, supersededAt: superseded.superseded_at };
+}
+
+/**
+ * The receipt's keyset from the boot report the entry stored for the earlier boot that signed it (the module's
+ * comment): fetched, its receipt id, keyset digest and derived nonce checked, then verified like `--report --nonce`
+ * with the stored collateral at its `checked_at` (or live collateral), the keyset's `not_after` at `served_at`, and the
+ * compose taken from the release list at `served_at`.
+ */
+async function storedBootAttestation(input: {
+  readonly source: StoredSource;
+  readonly older: OlderBoot;
+  readonly list: ReleaseList;
+  readonly pins: PinFlags;
+  readonly args: ParsedArgs;
+  readonly nowSecs: bigint;
+}): Promise<StoredBoot> {
+  const { older, source } = input;
+  const why = source.kind === "fetch"
+    ? `the receipt names keyset ${safeToken(older.keysetDigest)}, not the one ${source.origin.origin} attests now (${source.liveDigest}): an earlier boot signed it`
+    : `the receipt names keyset ${safeToken(older.keysetDigest)}, checked against the boot report saved in ${transcriptText(source.path)} (--boot-report)`;
+  const failed = (detail: string, waitedS: number, checks: readonly CheckLine[] = [], machine: JsonObject | null = null): StoredBoot =>
+    ({ ok: false, checks: [...checks, { id: "stored_attestation", status: "fail", detail }], lines: [], machine, waitedS });
+  let text: string;
+  let where: string;
+  let waitedS = 0;
+  if (source.kind === "fetch") {
+    if (source.apiKey === null) return failed(`${why}, and that boot's stored report is read with the key that made the request: set GRAY_API_KEY`, 0);
+    const url = new URL(`/v1/aci/receipts/${encodeURIComponent(older.receiptId)}/attestation`, source.origin);
+    const fetched = await fetchStoredAttestation(url, source.apiKey, source.ca, source.waitS);
+    waitedS = fetched.waitedS;
+    if (!fetched.ok) return failed(`${why}; its stored report: ${fetched.detail}`, waitedS);
+    text = fetched.text;
+    where = url.pathname;
+  } else {
+    text = source.text;
+    where = transcriptText(source.path);
+  }
+  const fetched = { waitedS };
+  const read = readStoredAttestationText(text);
+  if (!read.ok) return failed(`${why}; ${where} is not a stored boot report: ${read.message}`, fetched.waitedS);
+  const answer: StoredAttestation = read.answer;
+  if (answer.receipt_id !== older.receiptId) return failed(`${why}; the stored report answered is for receipt ${answer.receipt_id}`, fetched.waitedS);
+  if (answer.keyset_digest !== older.keysetDigest) return failed(`${why}; the stored report is for keyset ${answer.keyset_digest}, not the receipt's`, fetched.waitedS);
+  const derived = bootReportNonce(answer.keyset_digest);
+  if (answer.nonce !== derived) return failed(`${why}; the stored report's nonce ${answer.nonce} is not ${derived}, the one derived from its keyset digest`, fetched.waitedS);
+
+  const checkedAt = answer.collateral_check?.checked_at ?? null;
+  // The collateral's time and the receipt's, before the collateral is used (collateralWindowCheck says why).
+  const timeChecks: CheckLine[] = [
+    answer.collateral === null || checkedAt === null
+      ? { id: "collateral_window", status: "skip", detail: "no collateral stored with the report: the quote is verified with live collateral now, so no stored time is bound" }
+      : collateralWindowCheck(answer.attested_at, checkedAt, older.servedAt, input.nowSecs),
+    retentionWindowCheck(older, source, input.nowSecs),
+  ];
+  const timeFailure = timeChecks.find((check) => check.status === "fail");
+  if (timeFailure !== undefined) return failed(`${why}; the stored report's times are not accepted (${timeFailure.id})`, fetched.waitedS, timeChecks);
+  const verifier = await storedQuoteVerifier(input.args, answer.collateral, checkedAt, input.nowSecs);
+  let appraisal: QuoteAppraisal | null = null;
+  const quoteVerifier: QuoteVerifier = async (quote) => {
+    appraisal = await verifier(quote);
+    return appraisal;
+  };
+  const release = releaseListAt(input.list, older.servedAt);
+  const sealed = sealedFromReport(answer.report);
+  // The keyset's not_after is held to the time the receipt was signed, not to now.
+  const verification = await verifyReport(answer.report, { nonce: answer.nonce, release, nowSecs: older.servedAt, quoteVerifier });
+  const attested: AttestedKeyset = { verification, sealed, nonce: answer.nonce };
+  const window = releaseAtCheck(input.list, verification.composeHash, older.servedAt);
+  const tcbStatus = (appraisal as QuoteAppraisal | null)?.tcbStatus ?? null;
+  const collateral = answer.collateral === null ? "live" : "stored";
+  const issueDate = answer.collateral === null ? null : collateralIssueDate(answer.collateral);
+  const machine: JsonObject = {
+    source: source.kind === "fetch" ? "fetched" : "file",
+    keyset_digest: answer.keyset_digest,
+    nonce: answer.nonce,
+    attested_at: answer.attested_at,
+    served_at: older.servedAt,
+    collateral,
+    collateral_issue_date: issueDate === null ? null : transcriptText(issueDate),
+    checked_at: checkedAt,
+    tcb_status: tcbStatus === null ? null : safeToken(tcbStatus),
+    compose_hash: verification.composeHash,
+    superseded_at: window?.supersededAt ?? null,
+  };
+  const windowChecks = [...timeChecks, ...(window === null ? [] : [window.check])];
+  if (!attestedOkFrom(attested, input.pins) || sealed === null || sealed.digest !== older.keysetDigest || window?.check.status === "fail") {
+    const stored = verification.checks.filter((check) => check.status !== "pass").map((check) => ({ ...check, id: `stored:${check.id}` }));
+    const detail = sealed !== null && sealed.digest !== older.keysetDigest && verification.ok
+      ? `the stored report binds keyset ${sealed.digest}, not the receipt's`
+      : `the stored boot report did not verify: ${attestationFailure(verification, input.pins, sealed?.digest ?? null)}`;
+    return failed(`${why}; ${detail}`, fetched.waitedS, [...stored, ...windowChecks], machine);
+  }
+  const status = tcbStatus === null ? "(none reported)" : safeToken(tcbStatus);
+  const lines = [
+    `stored_report: attested at boot, stored report: ${why}. ${source.kind === "fetch" ? "The entry stored" : "The file holds"} that boot's report, attested at ${String(answer.attested_at)} with nonce ${answer.nonce}, `
+      + "derived from the keyset digest: no verifier chose it, so it shows the keyset came from the measured VM, not that the VM runs now\n",
+    answer.collateral === null
+      ? `collateral: none stored with the report: the quote was verified with live collateral now: TCB ${status}\n`
+      : `collateral: stored with the report, issued ${issueDate === null ? "(no issueDate)" : transcriptText(issueDate)}, the quote verified with it at ${String(checkedAt)}: TCB ${status}\n`,
+  ];
+  return { ok: true, attested, checks: windowChecks, lines, machine, attestedAt: answer.attested_at, waitedS: fetched.waitedS };
+}
+
 /** Whether the attested keyset came from a fully verified report under the requested pinning. */
 function attestedOkFrom(attested: AttestedKeyset, pins: PinFlags): boolean {
   const verification = attested.verification;
@@ -1439,6 +1866,9 @@ function receiptMachine(input: {
   readonly attestedOk: boolean;
   readonly pins: PinFlags;
   readonly receipt: Awaited<ReturnType<typeof verifyResponseReceiptText>> | null;
+  /** 1.8.0: STORED_NOTE for a keyset an earlier boot's stored report shows, and its `release_at` check. */
+  readonly note?: string;
+  readonly extra?: readonly CheckLine[];
 }): JsonObject {
   const verification = input.attested.verification;
   const receipt = input.receipt;
@@ -1447,9 +1877,10 @@ function receiptMachine(input: {
       id: "keyset_attestation",
       status: input.attestedOk ? "pass" : "fail",
       detail: input.attestedOk
-        ? `${input.attested.sealed?.digest ?? "(no keyset)"}; compose ${verification.composeHash ?? "(unpinned)"}${verification.osPinned ? "" : " (OS unpinned, accepted)"}`
+        ? `${input.attested.sealed?.digest ?? "(no keyset)"}; compose ${verification.composeHash ?? "(unpinned)"}${verification.osPinned ? "" : " (OS unpinned, accepted)"}${input.note ?? ""}`
         : attestationFailure(verification, input.pins, input.attested.sealed?.digest ?? null),
     },
+    ...(input.extra ?? []),
     ...(receipt?.checks ?? []),
   ];
   return {
@@ -1690,14 +2121,16 @@ type ReceiptFetch =
     /** Whether `laneOrigin` came from the answer's header rather than the flag. */
     readonly named: boolean;
     readonly pending: number;
+    /** 1.8.0: the `503 receipt_lookup_unavailable` answers waited out. */
+    readonly unavailable: number;
     readonly waitedS: number;
   }
-  | { readonly ok: false; readonly asked: URL; readonly status: number; readonly detail: string; readonly pending: number; readonly waitedS: number };
+  | { readonly ok: false; readonly asked: URL; readonly status: number; readonly detail: string; readonly pending: number; readonly unavailable: number; readonly waitedS: number };
 
 /**
  * `GET <origin>/v1/aci/receipts/<id>` with the key that made the request (docs/trust-model.en.md, "Checking it"): at
- * `--lane-origin` when given, else at `--origin`; a `503 receipt_pending` is asked again after its `Retry-After`
- * until `waitS` is spent. An entry replica names itself in every answer's `x-gray-lane-origin` (ER6): the receipt is
+ * `--lane-origin` when given, else at `--origin`; a `503 receipt_pending`, or (1.8.0) a `503 receipt_lookup_unavailable`
+ * when the entry's receipt store did not answer, is asked again after its `Retry-After` until `waitS` is spent. An entry replica names itself in every answer's `x-gray-lane-origin` (ER6): the receipt is
  * that replica's, so that origin, read by the rule of `lane-origin.ts`, is the one attested. The header only says
  * where; the receipt still verifies only under the keyset attested there.
  */
@@ -1713,6 +2146,7 @@ async function fetchReceipt(input: {
   const url = new URL(`/v1/aci/receipts/${encodeURIComponent(input.receiptId)}`, asked);
   const sleep = net.sleep ?? (NODE_NET.sleep as NonNullable<CliNet["sleep"]>);
   let pending = 0;
+  let unavailable = 0;
   let waitedS = 0;
   for (;;) {
     let answer: FetchedText;
@@ -1722,28 +2156,41 @@ async function fetchReceipt(input: {
       throw new UsageError(`cannot fetch ${asked.origin}${url.pathname}: ${messageOf(error)}`);
     }
     const code = answer.status === 200 ? null : errorCodeText(answer.text);
-    if (answer.status === 503 && code === "receipt_pending") {
+    if (answer.status === 503 && (code === "receipt_pending" || code === RECEIPT_LOOKUP_UNAVAILABLE)) {
       const retryS = retryAfterSeconds(answer.headers?.["retry-after"]);
       if (waitedS + retryS > input.waitS) {
-        return { ok: false, asked, status: 503, pending, waitedS, detail: `the entry still answers 503 receipt_pending after ${String(waitedS)} s: the answer may still be streaming; ask again, or give --wait more seconds` };
+        const detail = code === "receipt_pending"
+          ? `the entry still answers 503 receipt_pending after ${String(waitedS)} s: the answer may still be streaming; ask again, or give --wait more seconds`
+          : `the entry still answers 503 ${RECEIPT_LOOKUP_UNAVAILABLE} after ${String(waitedS)} s: its receipt store did not answer; ask again later, or give --wait more seconds`;
+        return { ok: false, asked, status: 503, pending, unavailable, waitedS, detail };
       }
-      pending += 1;
+      if (code === "receipt_pending") pending += 1;
+      else unavailable += 1;
       await sleep(retryS * 1000);
       waitedS += retryS;
       continue;
     }
-    if (answer.status !== 200) return { ok: false, asked, status: answer.status, pending, waitedS, detail: receiptRefusal(answer, code, asked, input.laneOrigin !== null) };
+    if (answer.status !== 200) return { ok: false, asked, status: answer.status, pending, unavailable, waitedS, detail: receiptRefusal(answer, code, asked, input.laneOrigin !== null) };
     const named = answer.headers?.[LANE_ORIGIN_HEADER];
-    if (named === undefined) return { ok: true, text: answer.text, asked, laneOrigin: input.laneOrigin, named: false, pending, waitedS };
+    if (named === undefined) return { ok: true, text: answer.text, asked, laneOrigin: input.laneOrigin, named: false, pending, unavailable, waitedS };
     const read = readLaneOrigin(named, input.origin);
     if (!read.ok) {
-      return { ok: false, asked, status: 200, pending, waitedS, detail: `the answer names ${transcriptText(named)} in ${LANE_ORIGIN_HEADER}, which is refused: ${read.reason}` };
+      return { ok: false, asked, status: 200, pending, unavailable, waitedS, detail: `the answer names ${transcriptText(named)} in ${LANE_ORIGIN_HEADER}, which is refused: ${read.reason}` };
     }
     if (input.laneOrigin !== null && read.origin.origin !== input.laneOrigin.origin) {
-      return { ok: false, asked, status: 200, pending, waitedS, detail: `asked ${input.laneOrigin.origin}, but the answer names ${read.origin.origin} in ${LANE_ORIGIN_HEADER} as the origin that answered` };
+      return { ok: false, asked, status: 200, pending, unavailable, waitedS, detail: `asked ${input.laneOrigin.origin}, but the answer names ${read.origin.origin} in ${LANE_ORIGIN_HEADER} as the origin that answered` };
     }
-    return { ok: true, text: answer.text, asked, laneOrigin: read.origin, named: input.laneOrigin === null, pending, waitedS };
+    return { ok: true, text: answer.text, asked, laneOrigin: read.origin, named: input.laneOrigin === null, pending, unavailable, waitedS };
   }
+}
+
+/** ` after 2 pending answer(s) (4 s)` and the like, or nothing when the receipt came at once. */
+function fetchWaits(fetched: { readonly pending: number; readonly unavailable: number; readonly waitedS: number }): string {
+  const parts = [
+    ...(fetched.pending === 0 ? [] : [`${String(fetched.pending)} pending answer(s)`]),
+    ...(fetched.unavailable === 0 ? [] : [`${String(fetched.unavailable)} receipt_lookup_unavailable answer(s)`]),
+  ];
+  return parts.length === 0 ? "" : ` after ${parts.join(" and ")} (${String(fetched.waitedS)} s)`;
 }
 
 /** Why the entry gave no receipt, with what to do about it; the key is never named. */
@@ -1755,19 +2202,22 @@ function receiptRefusal(answer: FetchedText, code: string | null, asked: URL, la
     const where = laneGiven
       ? ""
       : ` Only the copy of the entry that answered holds a receipt: pass the answer's ${LANE_ORIGIN_HEADER} header as --lane-origin${there === undefined ? "" : ` (this answer came from ${transcriptText(there)})`}.`;
-    return `${said}: no receipt with this id for this key. The entry keeps a receipt for an hour after the answer ends, and only for the key that made the request.${where}`
-      + " A receipt id carries no signed time, so a receipt the entry no longer gives is a failure here; to check one after that hour, check a saved receipt with --receipt.";
+    return `${said}: no receipt with this id for this key. The entry keeps a receipt for the time its signed retention_seconds says after the answer ends `
+      + `(30 days on an entry that stores its receipts; an hour on a receipt without retention_seconds), and only for the key that made the request.${where}`
+      + " A receipt id carries no signed time, so a receipt the entry no longer gives is a failure here; to check one after that time, check a saved receipt with --receipt.";
   }
   return said;
 }
 
 async function checkCommand(given: ParsedArgs): Promise<number> {
-  assertFlags(given, ["receipt", "request", "origin", "lane-origin", "response", "wait", "templates", "protocol", "allow", "release-key", "allow-freshness", "freshness-key", "allow-stack", "allow-stack-freshness", "accept-os-unpinned", "ca", "now", "pccs", "verifier-module"]);
+  assertFlags(given, ["receipt", "boot-report", "request", "origin", "lane-origin", "response", "wait", "templates", "protocol", "allow", "release-key", "allow-freshness", "freshness-key", "allow-stack", "allow-stack-freshness", "accept-os-unpinned", "ca", "now", "pccs", "verifier-module"]);
   if (given.positional.length > 1) throw new UsageError("check takes one receipt id");
   const receiptId = given.positional[0] ?? null;
   const savedPath = given.flags.get("receipt") ?? null;
   if ((receiptId === null) === (savedPath === null)) throw new UsageError("check needs a receipt id (the answer's x-receipt-id) or --receipt <saved receipt.json>: one of the two");
   if (receiptId !== null && !RECEIPT_ID_FORM.test(receiptId)) throw new UsageError("a receipt id is rcpt_ and 32 lower-case hex digits, as the answer's x-receipt-id names it");
+  const bootReportPath = given.flags.get("boot-report") ?? null;
+  if (bootReportPath !== null && savedPath === null) throw new UsageError("--boot-report goes with --receipt: a saved receipt and the /attestation answer saved for it");
   const requestPath = requiredFlag(given, "request");
   const origin = normalizeOrigin(given.flags.get("origin") ?? DEFAULT_ORIGIN);
   const laneOriginGiven = readLaneOriginFlag(given, origin);
@@ -1826,7 +2276,7 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
         receipt_id: receiptId,
         origin: origin.origin,
         ...(laneOriginGiven === null ? {} : { lane_origin: laneOriginGiven.origin }),
-        fetch: { from: answer.asked.origin, status: BigInt(answer.status), pending_answers: BigInt(answer.pending), waited_s: BigInt(answer.waitedS) },
+        fetch: { from: answer.asked.origin, status: BigInt(answer.status), pending_answers: BigInt(answer.pending), unavailable_answers: BigInt(answer.unavailable), waited_s: BigInt(answer.waitedS) },
         checks: [{ id: "receipt_fetch", status: "fail", detail: transcriptText(answer.detail) }],
       })}\n`);
       return 1;
@@ -1838,14 +2288,16 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
     receiptText = savedText as string;
   }
 
-  // 2. Attest the origin the receipt came from, and verify the receipt under the keyset it shows.
+  // 2. Attest the origin the receipt came from, and verify the receipt under the keyset it shows. With --boot-report
+  // no origin is attested: the receipt is verified under the boot report saved for it.
   const attestAt = laneOrigin ?? origin;
-  const attested = await attestFromOrigin(attestAt, pinned.list, ca, nowSecs, quoteVerifier);
-  const sealed = attested.sealed;
-  const attestedOk = attestedOkFrom(attested, pins);
-  const fetchLine = fetched === null
+  const attested = bootReportPath === null ? await attestFromOrigin(attestAt, pinned.list, ca, nowSecs, quoteVerifier) : null;
+  const sealed = attested?.sealed ?? null;
+  const attestedOk = attested !== null && attestedOkFrom(attested, pins);
+  const fetchLine = (fetched === null
     ? `receipt read from ${savedPath as string}\n`
-    : `receipt fetched from ${fetched.asked.origin}${fetched.pending === 0 ? "" : ` after ${String(fetched.pending)} pending answer(s) (${String(fetched.waitedS)} s)`}\n`;
+    : `receipt fetched from ${fetched.asked.origin}${fetchWaits(fetched)}\n`)
+    + (bootReportPath === null ? "" : `boot_report: ${transcriptText(bootReportPath)} (a saved /attestation answer): ${origin.origin} is not attested; the receipt is verified under that boot report and the release list alone\n`);
   const laneLine = laneOrigin === null
     ? ""
     : `lane_origin: ${laneOrigin.origin} (${fetched?.named === true ? `named by the answer's ${LANE_ORIGIN_HEADER}` : LANE_ORIGIN_HEADER}, a replica of ${origin.origin})\n`;
@@ -1856,12 +2308,12 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
     verdict,
     origin: origin.origin,
     ...(laneOrigin === null ? {} : { lane_origin: laneOrigin.origin }),
-    fetch: fetched === null ? null : { from: fetched.asked.origin, status: 200n, pending_answers: BigInt(fetched.pending), waited_s: BigInt(fetched.waitedS), lane_origin_named: fetched.named },
+    fetch: fetched === null ? null : { from: fetched.asked.origin, status: 200n, pending_answers: BigInt(fetched.pending), unavailable_answers: BigInt(fetched.unavailable), waited_s: BigInt(fetched.waitedS), lane_origin_named: fetched.named },
     release_key: releaseKeyHex,
     release_list: pinned.machine,
     peers: peers === null ? [] : peersMachine(peers),
   });
-  if (!attestedOk || sealed === null) {
+  if (attested !== null && (!attestedOk || sealed === null)) {
     preamble();
     out(fetchLine);
     out(laneLine);
@@ -1871,12 +2323,38 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
     out(`${toJsonString(checkMachine(receiptMachine({ attested, attestedOk, pins, receipt: null }), false, "FAIL", null))}\n`);
     return 1;
   }
-  const relayImage = attestedRelayImage(attested.verification.stackBoot);
+  // 1.8.0: a receipt of an earlier boot is verified under the keyset of the boot report the entry stored for it.
+  const stored = await storedFor({
+    receiptText,
+    live: attested,
+    bootReportPath,
+    origin: attestAt,
+    apiKey,
+    ca,
+    waitS: Math.max(waitS - (fetched?.waitedS ?? 0), 0),
+    list: pinned.list,
+    pins,
+    args,
+    nowSecs,
+  });
+  if (stored !== null && !stored.ok) {
+    preamble();
+    out(fetchLine);
+    out(laneLine);
+    printChecks(stored.checks);
+    out("VERDICT: FAIL\n");
+    const base = checkMachine(attested === null ? { receipt_id: null, keyset_digest: null } : receiptMachine({ attested, attestedOk, pins, receipt: null }), false, "FAIL", null);
+    out(`${toJsonString({ ...base, checks: stored.checks.map(checkValue), ...(stored.machine === null ? {} : { stored_attestation: stored.machine }) })}\n`);
+    return 1;
+  }
+  const used = stored === null ? (attested as AttestedKeyset) : stored.attested;
+  const keyset = used.sealed as SealedKeyset;
+  const relayImage = attestedRelayImage(used.verification.stackBoot);
   const receipt = await verifyResponseReceiptText(receiptText, {
     receivedBody,
     templates,
-    keyset: sealed,
-    expectedKeysetDigest: sealed.digest,
+    keyset,
+    expectedKeysetDigest: keyset.digest,
     ...(relayImage === undefined ? {} : { expectedRelayImage: relayImage }),
     ...(responseBytes === undefined ? {} : { responseBytes }),
     ...(protocol === undefined ? {} : { protocol }),
@@ -1911,8 +2389,8 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
         ...(freshnessFrom === null || pins.freshnessKey === null ? {} : { freshness: { text: freshnessText, publicKey: pins.freshnessKey } }),
       };
       peers = await peerChecks({
-        // What the receipt's own fetch left of --wait.
-        flags: { apiKey, list, waitS: Math.max(waitS - (fetched?.waitedS ?? 0), 0) },
+        // What the receipt's own fetch and its stored report's left of --wait.
+        flags: { apiKey, list, waitS: Math.max(waitS - (fetched?.waitedS ?? 0) - (stored?.waitedS ?? 0), 0) },
         origin: attestAt,
         receiptText,
         receipt,
@@ -1927,16 +2405,21 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
   }
 
   const ok = receipt.ok && idCheck.every((entry) => entry.status !== "fail") && (peers === null || peers.ok);
-  const outcome = receiptOutcome(receipt, idCheck.every((entry) => entry.status !== "fail") && !peersFailed(peers), peersExpired(peers), attested.verification.osPinned);
+  const outcome = receiptOutcome(receipt, idCheck.every((entry) => entry.status !== "fail") && !peersFailed(peers), peersExpired(peers), used.verification.osPinned);
   const verdict = outcome.verdict;
+  const note = stored === null ? "" : STORED_NOTE;
   preamble();
   out(fetchLine);
   out(laneLine);
   printChecks([{
     id: "keyset_attestation",
     status: "pass",
-    detail: `${sealed.digest}; compose ${attested.verification.composeHash ?? "(unpinned)"}${attested.verification.osPinned ? "" : " (OS unpinned, accepted)"}`,
+    detail: `${keyset.digest}; compose ${used.verification.composeHash ?? "(unpinned)"}${used.verification.osPinned ? "" : " (OS unpinned, accepted)"}${note}`,
   }]);
+  if (stored !== null) {
+    printChecks(stored.checks);
+    for (const line of stored.lines) out(line);
+  }
   const shown = joinedReceipt(receipt, peers);
   printChecks(idCheck);
   printChecks(shown.checks);
@@ -1947,8 +2430,10 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
       fetched,
       savedPath,
       attestAt,
-      digest: sealed.digest,
-      verification: attested.verification,
+      digest: keyset.digest,
+      verification: used.verification,
+      storedAttestedAt: stored === null ? null : stored.attestedAt,
+      bootReportPath,
       releaseKeyHex,
       receipt: shown,
       peers,
@@ -1956,8 +2441,8 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
     });
   }
   out(`VERDICT: ${verdict}\n`);
-  const machine = checkMachine(receiptMachine({ attested, attestedOk, pins, receipt: shown }), ok, verdict, peers);
-  out(`${toJsonString({ ...machine, ...expiredMachine(peers), ...partialMachine(receipt), checks: [...idCheck.map(checkValue), ...(machine.checks as Json[])] })}\n`);
+  const machine = checkMachine(receiptMachine({ attested: used, attestedOk: true, pins, receipt: shown, note, extra: stored?.checks ?? [] }), ok, verdict, peers);
+  out(`${toJsonString({ ...machine, ...(stored === null ? {} : { stored_attestation: stored.machine }), ...expiredMachine(peers), ...partialMachine(receipt), checks: [...idCheck.map(checkValue), ...(machine.checks as Json[])] })}\n`);
   return ok ? 0 : outcome.code;
 }
 
@@ -1969,6 +2454,10 @@ function printCheckSummary(input: {
   readonly attestAt: URL;
   readonly digest: string;
   readonly verification: AttestationVerification;
+  /** 1.8.0: when the keyset came from an earlier boot's stored report, that boot's `attested_at`; else null. */
+  readonly storedAttestedAt: bigint | null;
+  /** 1.8.0: the saved `/attestation` answer (`--boot-report`) the stored report was read from; null when fetched. */
+  readonly bootReportPath: string | null;
   readonly releaseKeyHex: string;
   readonly receipt: Awaited<ReturnType<typeof verifyResponseReceiptText>>;
   readonly peers: PeerReceiptsVerification | null;
@@ -1981,7 +2470,9 @@ function printCheckSummary(input: {
   const verification = input.verification;
   out("covered:\n");
   out(`  receipt    ${id}, ${where}\n`);
-  out(`  signature  signed with a key of keyset ${input.digest}, which remote attestation of ${input.attestAt.origin} shows\n`);
+  out(input.storedAttestedAt === null
+    ? `  signature  signed with a key of keyset ${input.digest}, which remote attestation of ${input.attestAt.origin} shows\n`
+    : `  signature  signed with a key of keyset ${input.digest}, which the boot report ${input.bootReportPath === null ? `${input.attestAt.origin} stored for an earlier boot` : `saved in ${transcriptText(input.bootReportPath)}`} shows (attested at boot, ${String(input.storedAttestedAt)}; that boot need not run now)\n`);
   out(`  release    that confidential VM runs compose ${verification.composeHash ?? "(none)"}, listed in Gray's release list signed by ${input.releaseKeyHex}`
     + `${verification.osPinned ? `; OS image ${verification.osImageHash ?? "(none)"} pinned` : "; OS image not pinned (accepted with --accept-os-unpinned)"}\n`);
   const rewrites: string[] = [];

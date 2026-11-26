@@ -137,7 +137,6 @@ import {
   isPositionForProtocol,
   isRewriteApi,
   replayApiChanges,
-  replayForwarded,
   replayTranslated,
   rewriteRuleFor,
   ruleAllowsValue,
@@ -146,14 +145,17 @@ import {
   stackVendorBodyDigest,
   stackVendorEventsSha256,
   textSha256Hex,
-  verifyForwarded,
-  verifyForwardedWithChanges,
   type AppliedAppend,
   type LaneProtocol,
   type LaneResponseRewrite,
   type LaneRewritePolicy,
   type RewriteApi,
 } from "@gray/lane";
+import {
+  replayForwarded,
+  verifyForwarded,
+  verifyForwardedWithChanges,
+} from "@gray/lane/receipt";
 import { applyRelayChanges } from "./relay-patch.ts";
 import { isWholeJsonBody, readStreamEnd } from "./response-end.ts";
 

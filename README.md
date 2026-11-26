@@ -1,6 +1,6 @@
-# gray-lane-verify 1.7.1 (v1.7.1-7f264111a618)
+# gray-lane-verify 1.8.0 (v1.8.0-71729a67d208)
 
-The source of `gray-lane-verify` 1.7.1, built from Gray's commit `7f264111a6185ce0f01cdea77ab0a4404a12d9bf`. gray-lane-verify checks one answer
+The source of `gray-lane-verify` 1.8.0, built from Gray's commit `71729a67d208c1a544f6b8f6f62cb30cc736ecdd`. gray-lane-verify checks one answer
 from Gray's confidential entry in one command. It fetches the answer's signed receipt and checks the remote attestation
 of the confidential VM that signed it against Gray's signed release list. It then verifies the receipt under the keys
 that attestation shows. When a provider's confidential VM served the answer, it checks that VM's attestation and the
@@ -8,20 +8,20 @@ receipt the VM made, with every change Gray declared to the request and the answ
 
 gray-lane-verify is licensed under the Apache License, Version 2.0 (`LICENSE`, `NOTICE`).
 
-This tree holds exactly the 165 files that the published bundle `gray-lane-verify-1.7.1.mjs` and the image
-`ghcr.io/gray-ai-dev/gray-lane-verify:1.7.1` are built from, at the paths they have in Gray's repository, plus the files Gray
+This tree holds exactly the 165 files that the published bundle `gray-lane-verify-1.8.0.mjs` and the image
+`ghcr.io/gray-ai-dev/gray-lane-verify:1.8.0` are built from, at the paths they have in Gray's repository, plus the files Gray
 writes for each release: this README, `SOURCE.json`, `rebuild.sh`, `.gitignore`, `LICENSE` and `NOTICE`. Tests,
 documentation and Gray's other services are not included. Each release is one commit in this repository, and its
-parent is the release published before it, so `git diff <previous tag> v1.7.1-7f264111a618` shows the code that changed between
+parent is the release published before it, so `git diff <previous tag> v1.8.0-71729a67d208` shows the code that changed between
 the two.
 
 ## Get it
 
 | Form | Where |
 |-|-|
-| One file for Node 22 or later, no install step | `https://releases.usefallback.com/lane-verify/1.7.1/gray-lane-verify-1.7.1.mjs`, with `.sha256` and `.sigstore.json` beside it, and `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES` in the same directory |
-| Container image | `ghcr.io/gray-ai-dev/gray-lane-verify:1.7.1`, also tagged `7f264111a618`; the same three files are in `/opt/gray-lane-verify/` |
-| Source | this repository, tag `v1.7.1-7f264111a618` |
+| One file for Node 22 or later, no install step | `https://releases.usefallback.com/lane-verify/1.8.0/gray-lane-verify-1.8.0.mjs`, with `.sha256` and `.sigstore.json` beside it, and `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES` in the same directory |
+| Container image | `ghcr.io/gray-ai-dev/gray-lane-verify:1.8.0`, also tagged `71729a67d208`; the same three files are in `/opt/gray-lane-verify/` |
+| Source | this repository, tag `v1.8.0-71729a67d208` |
 
 Gray signs the file and the image with its release key, the cosign public key in
 `deploy/relay/kit/keys/gray-assistant-cosign.pub`. Its SHA-256 is
@@ -30,20 +30,20 @@ repositories. Check a download before you run it:
 
 ```sh
 cosign verify-blob --key gray-assistant-cosign.pub \
-  --bundle gray-lane-verify-1.7.1.mjs.sigstore.json gray-lane-verify-1.7.1.mjs
-deploy/relay/kit/cosign.sh verify-file gray-lane-verify-1.7.1.mjs
-deploy/relay/kit/cosign.sh verify-image ghcr.io/gray-ai-dev/gray-lane-verify:1.7.1
+  --bundle gray-lane-verify-1.8.0.mjs.sigstore.json gray-lane-verify-1.8.0.mjs
+deploy/relay/kit/cosign.sh verify-file gray-lane-verify-1.8.0.mjs
+deploy/relay/kit/cosign.sh verify-image ghcr.io/gray-ai-dev/gray-lane-verify:1.8.0
 ```
 
-`cosign.sh verify-image` prints the commit the image was signed as built from: it is `7f264111a6185ce0f01cdea77ab0a4404a12d9bf`.
-`node gray-lane-verify-1.7.1.mjs --version` prints the same commit.
+`cosign.sh verify-image` prints the commit the image was signed as built from: it is `71729a67d208c1a544f6b8f6f62cb30cc736ecdd`.
+`node gray-lane-verify-1.8.0.mjs --version` prints the same commit.
 
 ## Run it
 
 ```sh
 export GRAY_API_KEY=...   # the key that made the request; read from the environment, never printed
-node gray-lane-verify-1.7.1.mjs check <x-receipt-id> --request request.json --response response.bin
-docker run --rm -v "$PWD:/work" -e GRAY_API_KEY ghcr.io/gray-ai-dev/gray-lane-verify:1.7.1 \
+node gray-lane-verify-1.8.0.mjs check <x-receipt-id> --request request.json --response response.bin
+docker run --rm -v "$PWD:/work" -e GRAY_API_KEY ghcr.io/gray-ai-dev/gray-lane-verify:1.8.0 \
   check <x-receipt-id> --request request.json --response response.bin
 ```
 
@@ -52,15 +52,21 @@ carried an `x-gray-lane-origin` header, pass it as `--lane-origin`. The command 
 they covered, `VERDICT: PASS` or `VERDICT: FAIL`, and one JSON line for scripts. It exits 0 when every check passed,
 1 when one failed or the entry gave no receipt, and 2 on a usage or I/O error.
 
-The entry keeps a receipt in memory for an hour after the answer ends, with the records of each attempt a provider's
-VM served (`/v1/aci/receipts/<id>/peers/<n>`). To check later, save the receipt while the entry holds it and pass it
-as `--receipt <file>`. The command still asks the entry for each attempt's record. When the entry answers
-`404 receipt_not_found` for one after the receipt's signed `served_at` plus 7 500 s (an hour for the longest request,
-the hour the entry keeps a receipt, and 300 s for clock difference), the line is `EXPIRED peer:<n>:fetch`: that
-attempt was not checked. If no check failed, the command prints `VERDICT: EXPIRED` and exits 4, and the JSON line has
-`ok: false` and `expired_peers`. A failed check is still `VERDICT: FAIL`, exit 1. Before that time the same answer is
-a failure, as is any other answer at any time. A receipt id alone carries no signed time, so a receipt the entry no
-longer gives is a failure. Versions before 1.7.1 print `VERDICT: FAIL` for an expired record.
+The entry keeps a receipt, with the records of each attempt a provider's VM served
+(`/v1/aci/receipts/<id>/peers/<n>`), for the time the receipt's signed `retention_seconds` names: 30 days on an entry
+that stores an encrypted copy of it, an hour (in memory) on a receipt without the member. Any entry copy reads the
+stored copy. A receipt signed by an entry boot that no longer runs names a keyset the entry no longer attests; from
+1.8.0 the command then fetches that boot's own report (`/v1/aci/receipts/<id>/attestation`), checks it under the nonce
+derived from the keyset with the Intel collateral the boot stored beside it, and prints `attested at boot, stored
+report` with the collateral's date and TCB status. A `503 receipt_lookup_unavailable` is asked again within `--wait`.
+To check later than that, save the receipt while the entry holds it and pass it as `--receipt <file>`. The command
+still asks the entry for each attempt's record. When the entry answers `404 receipt_not_found` for one after the
+receipt's signed `served_at` plus its `retention_seconds` (3 600 when absent) plus 3 900 s (an hour for the longest
+request and 300 s for clock difference), the line is `EXPIRED peer:<n>:fetch`: that attempt was not checked. If no
+check failed, the command prints `VERDICT: EXPIRED` and exits 4, and the JSON line has `ok: false` and
+`expired_peers`. A failed check is still `VERDICT: FAIL`, exit 1. Before that time the same answer is a failure, as is
+any other answer at any time. A receipt id alone carries no signed time, so a receipt the entry no longer gives is a
+failure. Versions before 1.7.1 print `VERDICT: FAIL` for an expired record; 1.7.1 uses 7 500 s for every receipt.
 
 When you leave before reading the whole answer, the entry signs `served_as: client_left`, and the receipt's
 `events_sha256` (or, for a buffered answer, `body_sha256`) covers everything the entry queued for you. A `--response`
@@ -144,7 +150,7 @@ before 1.5.0 fail these receipts.
 
 ## What to review
 
-> Review this tree (and `git diff <the tag you run now> v1.7.1-7f264111a618`) for any way gray-lane-verify could print
+> Review this tree (and `git diff <the tag you run now> v1.8.0-71729a67d208`) for any way gray-lane-verify could print
 > `VERDICT: PASS` or exit 0 for an answer whose receipt, attestation or release list does not check out, or for one
 > whose receipt says it arrived through Gray's API (`aci/1+gray-api`), or could send
 > the API key anywhere other than the entry origin the user named or a replica that origin's answer named. Trace:
@@ -162,7 +168,7 @@ The tool writes nothing to disk. It prints check lines and hashes, never request
 for the other) with the build commands of `deploy/lane-verify/release.sh`. It prints `rebuild.sh: bundle sha256:…`,
 which must equal the published `.sha256`, `rebuild.sh: notices sha256:…`, the published `THIRD_PARTY_NOTICES`', and
 `rebuild.sh: manifest sha256:…`, which must equal the published image's
-manifest for the same platform: `docker buildx imagetools inspect --raw ghcr.io/gray-ai-dev/gray-lane-verify:1.7.1` lists one
+manifest for the same platform: `docker buildx imagetools inspect --raw ghcr.io/gray-ai-dev/gray-lane-verify:1.8.0` lists one
 manifest per platform. Gray rebuilds this way from this tree before it publishes a tag, and does not publish when
 any of them differs.
 
