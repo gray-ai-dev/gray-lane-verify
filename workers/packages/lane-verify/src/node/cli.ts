@@ -14,7 +14,7 @@
  *         [--allow-freshness <release-list.freshness.json> --freshness-key <64 hex>]
  *         [--response <raw response file>] [--templates <texts.json>]
  *         [--protocol <anthropic_messages|open_ai_chat|open_ai_responses|gemini|a standard API's name>]
- *         [--peers --allow-stack <stack release-list.json> [--allow-stack-freshness <file>]]
+ *         [--peers --allow-stack <stack release-list.json> [--allow-stack-freshness <file>] [--wait <seconds>]]
  *         [--ca <pem>] [--now <unix>] [--pccs <url>] [--verifier-module <file>]
  *
  *     gray-lane-verify check (<receipt id> | --receipt <receipt.json>) --request <body file>
@@ -28,7 +28,8 @@
  * it fetches the receipt with the key that made the request (`GRAY_API_KEY`, never a flag): at `--lane-origin` when
  * given (the answer's `x-gray-lane-origin`), else at `--origin`, where an entry with replicas names the replica that
  * answered in the same header and that replica is the one attested; a `503 receipt_pending` is asked again after its
- * `Retry-After`, for up to `--wait` seconds (default 30). With `--receipt` it reads a saved one. Then it does what
+ * `Retry-After`, for up to `--wait` seconds (default 30), and the same seconds cover the provider VM's records below.
+ * With `--receipt` it reads a saved one. Then it does what
  * `receipt --origin [--lane-origin] --peers` does: attests the origin the receipt came from against Gray's signed
  * release list, verifies the receipt under the keyset that attestation shows, and, when the receipt names attempts in
  * a provider's confidential VM, fetches each `/peers/<n>` record and checks the VM's attestation against Gray's signed
@@ -96,8 +97,12 @@
  * inner receipt under its attested keyset, tied to this receipt by its `peer.entry`, with the same request in and,
  * for the attempt that served, the same answer out. The inner receipt's attempts print what the relay changed in the
  * same form as a direct receipt's (`peer:<n>:attempt:<k>:relay_changes: unchanged…` or `changed by the deployment: …`).
- * A missing inner receipt fails where the stack VM must have made one. `--peers` needs `--origin`. Without it the
- * outer receipt is checked as before and the machine output has no `peers` member.
+ * A missing inner receipt fails where the stack VM must have made one. The outer receipt holds no upstream.response for
+ * an attempt a stack VM answered, so its `served_attempt` passes on `peer:<n>`, naming it, when that attempt's checks
+ * tie the answer (`withPeerTie`), and is skipped otherwise. A `502 peer_receipt_unavailable` (the stack VM has not
+ * signed its receipt yet) is asked again after its `Retry-After` (1 to 10 s, cut to what is left), for up to `--wait`
+ * seconds (default 30); every other answer is taken as it is. `--peers` needs `--origin`. Without it the outer receipt
+ * is checked as before and the machine output has no `peers` member.
  *
  * `receipt --lane-origin` (docs/design/entry-replicas.md ER6, EI8): an entry with replicas names the replica that
  * served in the response header `x-gray-lane-origin`, and only that replica holds the receipt and its peer records.
@@ -132,9 +137,31 @@
  * command takes nothing more than for a JSON request: `--request` is the whole body as sent, files included. A body
  * that does not begin with its boundary line does not replay.
  *
+ * `receipt --peers` and `check` always ask the entry for each `/peers/<n>` record, whatever the time (1.7.1). The entry
+ * keeps a receipt and its peer records in memory for an hour after the answer ends. When it answers `404
+ * receipt_not_found` for a record after the outer receipt's signed `served_at` plus PEER_RECORD_RETENTION_BOUND_SECONDS
+ * (7 500 s: the longest request, the hour of retention and 300 s of clock difference), the line is `EXPIRED
+ * peer:<n>:fetch` and, when no check failed, the verdict is `EXPIRED`, exit code 4: that attempt was not checked, and
+ * nothing says it was changed. Inside that window the same answer is a FAIL, and so is every other answer. Only a
+ * saved receipt gets there: `check <receipt id>` has no signed time before it holds the receipt, so a receipt the
+ * entry no longer gives is a FAIL.
+ *
+ * A receipt whose answer the client left (`served_as: client_left`, 1.7.1) commits to every event or body byte the
+ * entry queued for the client. With `--response` bytes shorter than that, which do not end the answer by its protocol,
+ * the digest line is `PARTIAL` and, when no check failed, the verdict is `PARTIAL`, exit code 5: the receipt and the
+ * request verified, and the answer's digest could not be recomputed from the bytes held. The raw `body_hash` is not
+ * compared on such a receipt, since keep-alive comments the entry queued are in it. Bytes that end the answer
+ * ([DONE], response.completed, response.incomplete, response.failed, message_stop, a whole JSON body) and do not match
+ * stay a FAIL, and so do any bytes of a receipt with another `served_as` or `replaced_error: true`, and an event against
+ * a receipt of a client that left before any answer. Precedence: FAIL (1), then PARTIAL (5), then EXPIRED (4), then
+ * VALID, NOT END TO END (3), then PASS.
+ *
  * Exit codes: 0 every check passed and the requested pinning was accepted, 1 a check failed or the
  * pinning was not accepted (for `check`, also: the entry did not give the receipt), 2 usage or I/O error,
- * 3 (`receipt`, `check`) the receipt is valid but the request arrived through Gray's API, so it is not end to end.
+ * 3 (`receipt`, `check`) the receipt is valid but the request arrived through Gray's API, so it is not end to end,
+ * 4 (`receipt --peers`, `check`) no check failed, and the entry no longer holds a peer record past its retention,
+ * 5 (`receipt`, `check`) no check failed, and the `--response` bytes are shorter than what the entry queued for a client
+ * that left (`served_as: client_left`).
  */
 import { createHash, randomBytes, X509Certificate } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
@@ -147,9 +174,9 @@ import { get, isObject, parseStrict, toJsonString, type Json, type JsonObject } 
 import { isRewriteApi } from "@gray/lane";
 import { verifyAttestation, type AttestationVerification, type QuoteVerifier, type VerifyCheck } from "../attestation.ts";
 import { LANE_ORIGIN_HEADER, readLaneOrigin } from "../lane-origin.ts";
-import { verifyResponseReceiptText, type ReceiptProtocol, type StackReceiptSummary, type TemplateText } from "../receipt.ts";
+import { verifyResponseReceiptText, type ReceiptCheck, type ReceiptProtocol, type StackReceiptSummary, type TemplateText } from "../receipt.ts";
 import type { PeerReleaseList } from "../peer.ts";
-import { peerNumbersToFetch, readPeerAnswerText, verifyPeerReceipts, type PeerAnswer, type PeerAnswerError, type PeerReceiptsVerification } from "../peer-receipt.ts";
+import { peerNumbersToFetch, readPeerAnswerText, verifyPeerReceipts, withPeerTie, type PeerAnswer, type PeerAnswerError, type PeerReceiptsVerification } from "../peer-receipt.ts";
 import { isStackRelayImage, STACK_RELAY_ID_PATTERN, type StackBootResult } from "../stack-boot.ts";
 import { MAX_RELEASE_LIST_BYTES, osImageProvenance, readReleaseListText, type ReleaseList } from "../release-list.ts";
 import { releaseFreshnessLocation } from "../release-freshness.ts";
@@ -354,7 +381,7 @@ function usage(): string {
     "           [--allow-freshness <file> --freshness-key <64 hex>]",
     "           [--response <raw response file>] [--templates <texts.json>]",
     "           [--protocol <anthropic_messages|open_ai_chat|open_ai_responses|gemini|...>]",
-    "           [--peers --allow-stack <stack release-list.json> [--allow-stack-freshness <file>]]",
+    "           [--peers --allow-stack <stack release-list.json> [--allow-stack-freshness <file>] [--wait <seconds>]]",
     "           [--ca <pem>] [--now <unix>] [--pccs <url>] [--verifier-module <file>]",
     "       gray-lane-verify check (<receipt id> | --receipt <receipt.json>) --request <body file>",
     "           [--origin <entry origin>] [--lane-origin <url>] [--response <raw response file>] [--wait <seconds>]",
@@ -372,7 +399,8 @@ function usage(): string {
     "  --response <file>       the raw bytes you received (SSE framing included): also checks the answer",
     `  --origin <url>          the entry you sent the request to (default ${DEFAULT_ORIGIN})`,
     "  --lane-origin <url>     the answer's x-gray-lane-origin header, when it had one",
-    "  --wait <seconds>        how long to keep asking while the entry answers 503 receipt_pending (default 30)",
+    "  --wait <seconds>        how long to keep asking while the entry answers 503 receipt_pending, or",
+    "                          502 peer_receipt_unavailable for a provider VM's record (default 30, in all)",
     `  For ${DEFAULT_ORIGIN} the release lists are fetched from where Gray publishes them and accepted`,
     "  only under the release and freshness keys built into this tool (--version names its source commit).",
     "  For another origin pass --allow, --release-key and, for a provider's VM, --allow-stack.",
@@ -406,6 +434,8 @@ function usage(): string {
     "  --allow-stack-freshness <file>  its freshness document, under the same --freshness-key. Without it, when a",
     "                          freshness key is pinned, the .freshness.json beside --allow-stack is read, and",
     "                          one that cannot be read leaves the list current for a day after its issued_at",
+    "  --wait <seconds>        with --peers: how long to keep asking while the entry answers 502",
+    "                          peer_receipt_unavailable for a VM's record (default 30)",
     "",
     "  Plain PASS requires both a pinned compose hash and a pinned OS image.",
     "  --ca <pem> replaces Node's default trust store; it is not added to it.",
@@ -414,7 +444,13 @@ function usage(): string {
     "exit codes: 0 all checks passed and pinning accepted, 1 a check failed or pinning was not",
     "            accepted (check: or the entry did not give the receipt), 2 usage/IO error,",
     "            3 (receipt, check) VALID, NOT END TO END: the receipt is genuine, and the request",
-    "            arrived through Gray's API, so your connection did not end in the attested VM",
+    "            arrived through Gray's API, so your connection did not end in the attested VM,",
+    "            4 (receipt --peers, check) EXPIRED: no check failed, and the entry no longer holds",
+    "            a provider VM's record: asked after the saved receipt's served_at + 7500 s",
+    "            (the entry keeps records for an hour after the answer ends), so it was not checked,",
+    "            5 (receipt, check) PARTIAL: no check failed, and the entry recorded served_as:",
+    "            client_left: the --response bytes are shorter than what it queued for the client",
+    "            and do not end the answer, so the response digest was not recomputed",
     "",
   ].join("\n");
 }
@@ -915,13 +951,16 @@ function safeToken(text: string): string {
   return text.replace(/[^A-Za-z0-9_.:-]/g, "_");
 }
 
-function printChecks(checks: readonly VerifyCheck[]): void {
+/** A check line of any of the verifiers: attestation (`VerifyCheck`) or receipt (`ReceiptCheck`, which can be `expired`). */
+type CheckLine = VerifyCheck | ReceiptCheck;
+
+function printChecks(checks: readonly CheckLine[]): void {
   for (const check of checks) {
     out(`${transcriptText(check.status.toUpperCase().padEnd(4))} ${transcriptText(check.id)}: ${transcriptText(check.detail)}\n`);
   }
 }
 
-function checkValue(check: VerifyCheck): JsonObject {
+function checkValue(check: CheckLine): JsonObject {
   return { id: transcriptText(check.id), status: check.status, detail: transcriptText(check.detail) };
 }
 
@@ -938,7 +977,7 @@ interface AttestedKeyset {
 }
 
 async function receiptCommand(args: ParsedArgs): Promise<number> {
-  assertFlags(args, ["request", "origin", "lane-origin", "report", "nonce", "allow", "accept-os-unpinned", "release-key", "allow-freshness", "freshness-key", "response", "templates", "protocol", "ca", "now", "pccs", "verifier-module", "peers", "allow-stack", "allow-stack-freshness"]);
+  assertFlags(args, ["request", "origin", "lane-origin", "report", "nonce", "allow", "accept-os-unpinned", "release-key", "allow-freshness", "freshness-key", "response", "templates", "protocol", "ca", "now", "pccs", "verifier-module", "peers", "allow-stack", "allow-stack-freshness", "wait"]);
   if (args.positional.length !== 1) throw new UsageError("receipt needs exactly one receipt file");
   const receiptPath = args.positional[0] as string;
   const receiptText = readText(receiptPath, "receipt");
@@ -1024,7 +1063,8 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
       });
 
   const ok = receipt.ok && (peers === null || peers.ok);
-  const outcome = receiptOutcome(receipt, peers === null || peers.ok, attested.verification.osPinned);
+  const outcome = receiptOutcome(receipt, !peersFailed(peers), peersExpired(peers), attested.verification.osPinned);
+  const shown = joinedReceipt(receipt, peers);
   out(`gray-lane-verify receipt ${receiptPath}\n`);
   out(`${pinned.line}\n`);
   out(laneLine);
@@ -1033,11 +1073,11 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
     status: "pass",
     detail: `${sealed.digest}; compose ${attested.verification.composeHash ?? "(unpinned)"}${attested.verification.osPinned ? "" : " (OS unpinned, accepted)"}`,
   }]);
-  printChecks(receipt.checks);
+  printChecks(shown.checks);
   if (peers !== null) printChecks(peers.checks);
   out(`VERDICT: ${outcome.verdict}\n`);
-  const machine = withLaneOrigin(receiptMachine({ attested, attestedOk, pins, receipt }), laneOrigin);
-  out(`${toJsonString(peers === null ? machine : { ...machine, ok: machine.ok === true && peers.ok, peers: peersMachine(peers) })}\n`);
+  const machine = withLaneOrigin(receiptMachine({ attested, attestedOk, pins, receipt: shown }), laneOrigin);
+  out(`${toJsonString(peers === null ? { ...machine, ...partialMachine(receipt) } : { ...machine, ok: machine.ok === true && peers.ok, peers: peersMachine(peers), ...expiredMachine(peers), ...partialMachine(receipt) })}\n`);
   return ok ? 0 : outcome.code;
 }
 
@@ -1045,15 +1085,66 @@ async function receiptCommand(args: ParsedArgs): Promise<number> {
 export const NOT_END_TO_END_VERDICT = "VALID, NOT END TO END: arrived through Gray's API";
 /** The exit code of `NOT_END_TO_END_VERDICT`. */
 export const EXIT_NOT_END_TO_END = 3;
+/** `receipt --peers` and `check`'s verdict when no check failed and a peer record had expired (1.7.1). */
+export const EXPIRED_VERDICT = "EXPIRED";
+/** The exit code of `EXPIRED_VERDICT`. */
+export const EXIT_EXPIRED = 4;
+/** `receipt` and `check`'s verdict when no check failed and the response bytes are a part of what a client that left was queued (1.7.1). */
+export const PARTIAL_VERDICT = "PARTIAL";
+/** The exit code of `PARTIAL_VERDICT`. */
+export const EXIT_PARTIAL = 5;
 
 /**
  * The verdict line and exit code of a receipt's checks, with whether every check but the arrival passed (`valid`): a
  * receipt whose only failed check is `client_connection` is genuine and not end to end (docs/design/one-address.md).
+ * `others`: no other check failed; `expired`: a peer record was past the entry's retention. A failed check wins over an
+ * expired record, so an expired record can never hide one; an expired record wins over the arrival, since part of the
+ * request was not checked at all. A partial response (1.7.1) comes after a failed check and before an expired record:
+ * the bytes held could not be checked against the receipt at all.
  */
-function receiptOutcome(receipt: Awaited<ReturnType<typeof verifyResponseReceiptText>>, others: boolean, osPinned: boolean): { readonly verdict: string; readonly code: number; readonly valid: boolean } {
+function receiptOutcome(receipt: Awaited<ReturnType<typeof verifyResponseReceiptText>>, others: boolean, expired: boolean, osPinned: boolean): { readonly verdict: string; readonly code: number; readonly valid: boolean } {
   if (!others || receipt.verdict === "fail") return { verdict: "FAIL", code: 1, valid: false };
+  if (receipt.verdict === "partial") return { verdict: `${PARTIAL_VERDICT}${osPinned ? "" : " (OS UNPINNED)"}`, code: EXIT_PARTIAL, valid: false };
+  if (expired) return { verdict: `${EXPIRED_VERDICT}${osPinned ? "" : " (OS UNPINNED)"}`, code: EXIT_EXPIRED, valid: false };
   if (receipt.verdict === "not_end_to_end") return { verdict: `${NOT_END_TO_END_VERDICT}${osPinned ? "" : " (OS UNPINNED)"}`, code: EXIT_NOT_END_TO_END, valid: true };
   return { verdict: osPinned ? "PASS" : "PASS (OS UNPINNED)", code: 0, valid: true };
+}
+
+/** The receipt as printed: with the peer checks, its `served_attempt` passes on the attempt they tie (`withPeerTie`). */
+function joinedReceipt<T extends { readonly checks: readonly ReceiptCheck[] }>(receipt: T, peers: PeerReceiptsVerification | null): T {
+  return peers === null ? receipt : ({ ...receipt, checks: withPeerTie(receipt.checks, peers) } as T);
+}
+
+/** The peer checks failed: a check failed, or they did not pass for any reason but an expired record (fail-closed). */
+function peersFailed(peers: PeerReceiptsVerification | null): boolean {
+  return peers !== null && !peers.ok && !peersExpired(peers);
+}
+
+/** Every peer check that did not pass was skipped or an expired record, and there was one. */
+function peersExpired(peers: PeerReceiptsVerification | null): boolean {
+  return peers !== null && peers.expired.length > 0 && peers.checks.every((check) => check.status !== "fail");
+}
+
+/**
+ * The machine output's `partial_response`, only for a `partial` verdict, so every other machine line is as it was: the
+ * receipt's `served_as` and `served_attempt`, and the bytes and events (null for a buffered answer) held.
+ */
+function partialMachine(receipt: Awaited<ReturnType<typeof verifyResponseReceiptText>>): JsonObject {
+  const partial = receipt.partialResponse;
+  if (partial === null) return {};
+  return {
+    partial_response: {
+      served_as: partial.served_as,
+      served_attempt: safeToken(partial.served_attempt),
+      bytes_received: BigInt(partial.bytes_received),
+      events_received: partial.events_received === null ? null : BigInt(partial.events_received),
+    },
+  };
+}
+
+/** The machine output's `expired_peers`, only when a record had expired, so every other machine line is as it was. */
+function expiredMachine(peers: PeerReceiptsVerification | null): JsonObject {
+  return peers === null || peers.expired.length === 0 ? {} : { expired_peers: peers.expired.map(safeToken) };
 }
 
 /**
@@ -1079,6 +1170,8 @@ function withLaneOrigin(machine: JsonObject, laneOrigin: URL | null): JsonObject
 interface PeerFlags {
   readonly apiKey: string;
   readonly list: PeerReleaseList;
+  /** How long, in seconds of `Retry-After`, the records may still be asked again (`--wait`, or what `check` left of it). */
+  readonly waitS: number;
 }
 
 function readPeerFlags(args: ParsedArgs, origin: URL | null, pins: PinFlags): PeerFlags | null {
@@ -1086,6 +1179,7 @@ function readPeerFlags(args: ParsedArgs, origin: URL | null, pins: PinFlags): Pe
   const stackFreshness = args.flags.get("allow-stack-freshness");
   if (!args.flags.has("peers")) {
     if (stackPath !== undefined || stackFreshness !== undefined) throw new UsageError("--allow-stack and --allow-stack-freshness are only meaningful with --peers");
+    if (args.flags.has("wait")) throw new UsageError("--wait is only meaningful with --peers: it bounds the asks for a provider VM's records");
     return null;
   }
   if (origin === null) throw new UsageError("receipt --peers needs --origin <lane origin>: the entry serves each peer attempt's records for the receipt");
@@ -1110,7 +1204,8 @@ function readPeerFlags(args: ParsedArgs, origin: URL | null, pins: PinFlags): Pe
     publicKey: pins.releaseKey,
     ...(freshnessFrom === null || pins.freshnessKey === null ? {} : { freshness: { text: freshnessText, publicKey: pins.freshnessKey } }),
   };
-  return { apiKey, list };
+  const waitS = args.flags.has("wait") ? parseWait(args.flags.get("wait") as string) : DEFAULT_WAIT_S;
+  return { apiKey, list, waitS };
 }
 
 /**
@@ -1146,21 +1241,39 @@ async function peerChecks(input: {
 }): Promise<PeerReceiptsVerification> {
   const parsed = parseReceiptText(input.receiptText);
   if (input.receipt.verdict === "fail" || !parsed.ok || input.receipt.receiptId === null) {
-    return { ok: false, checks: [{ id: "peers", status: "skip", detail: "not checked: the outer receipt did not verify" }], peers: [] };
+    return { ok: false, checks: [{ id: "peers", status: "skip", detail: "not checked: the outer receipt did not verify" }], peers: [], expired: [], tied: null };
   }
   const outer = parsed.value;
   const answers = new Map<string, PeerAnswer | PeerAnswerError>();
+  const sleep = net.sleep ?? (NODE_NET.sleep as NonNullable<CliNet["sleep"]>);
+  // One --wait for every record: the seconds slept for one are gone for the next.
+  let waitedS = 0;
   for (const n of peerNumbersToFetch(outer)) {
     const url = new URL(`/v1/aci/receipts/${encodeURIComponent(input.receipt.receiptId)}/peers/${n}`, input.origin);
-    let fetched: { readonly status: number; readonly text: string };
+    let fetched: FetchedText;
+    let waitedHereS = 0;
     try {
-      fetched = await net.getWithKey(url, input.flags.apiKey, input.ca, MAX_PEER_ANSWER_BYTES);
+      for (;;) {
+        fetched = await net.getWithKey(url, input.flags.apiKey, input.ca, MAX_PEER_ANSWER_BYTES);
+        // The stack VM has not signed its receipt yet (receipt-route.ts), or the entry could not reach it: ask again.
+        // A receipt that does not match (peer_receipt_mismatch), and every other answer, is taken as it is.
+        if (fetched.status !== 502 || exactErrorCode(fetched.text) !== PEER_RECEIPT_UNAVAILABLE) break;
+        const leftS = input.flags.waitS - waitedS;
+        if (leftS <= 0) break;
+        const retryS = Math.min(retryAfterSeconds(fetched.headers?.["retry-after"]), leftS);
+        await sleep(retryS * 1000);
+        waitedS += retryS;
+        waitedHereS += retryS;
+      }
     } catch (error) {
       answers.set(n.toString(), { error: `cannot fetch ${url.pathname}: ${messageOf(error)}` });
       continue;
     }
     if (fetched.status !== 200) {
-      answers.set(n.toString(), { error: `${url.pathname} answered ${fetched.status}${errorCodeOf(fetched.text)}` });
+      // The status and the exact code: verifyPeerReceipts reads a 404 receipt_not_found past the retention as expired.
+      const code = exactErrorCode(fetched.text);
+      const still = fetched.status === 502 && code === PEER_RECEIPT_UNAVAILABLE ? `, still after ${String(waitedHereS)} s: ask again later, or give --wait more seconds` : "";
+      answers.set(n.toString(), { error: `${url.pathname} answered ${fetched.status}${errorCodeOf(fetched.text)}${still}`, status: fetched.status, code });
       continue;
     }
     const read = readPeerAnswerText(fetched.text);
@@ -1176,6 +1289,19 @@ async function peerChecks(input: {
     nowSecs: input.nowSecs,
     answers,
   });
+}
+
+/** The entry's 502 for a record of a stack VM it could not get yet (receipt-route.ts), the one answer asked again. */
+const PEER_RECEIPT_UNAVAILABLE = "peer_receipt_unavailable";
+
+/** The `error.code` string of an ACI error body (`{error: {code}}`) exactly as sent, or null. */
+function exactErrorCode(text: string): string | null {
+  try {
+    const code = get(get(parseStrict(text), "error"), "code");
+    return typeof code === "string" ? code : null;
+  } catch {
+    return null;
+  }
 }
 
 /** ` (<code>)` of an ACI error body (`{error: {code}}`), or nothing. */
@@ -1316,7 +1442,7 @@ function receiptMachine(input: {
 }): JsonObject {
   const verification = input.attested.verification;
   const receipt = input.receipt;
-  const checks: VerifyCheck[] = [
+  const checks: CheckLine[] = [
     {
       id: "keyset_attestation",
       status: input.attestedOk ? "pass" : "fail",
@@ -1629,7 +1755,8 @@ function receiptRefusal(answer: FetchedText, code: string | null, asked: URL, la
     const where = laneGiven
       ? ""
       : ` Only the copy of the entry that answered holds a receipt: pass the answer's ${LANE_ORIGIN_HEADER} header as --lane-origin${there === undefined ? "" : ` (this answer came from ${transcriptText(there)})`}.`;
-    return `${said}: no receipt with this id for this key. A receipt is kept for an hour and only for the key that made the request.${where}`;
+    return `${said}: no receipt with this id for this key. The entry keeps a receipt for an hour after the answer ends, and only for the key that made the request.${where}`
+      + " A receipt id carries no signed time, so a receipt the entry no longer gives is a failure here; to check one after that hour, check a saved receipt with --receipt.";
   }
   return said;
 }
@@ -1768,9 +1895,9 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
   let peers: PeerReceiptsVerification | null = null;
   if (peerCount > 0) {
     if (apiKey === null) {
-      peers = { ok: false, peers: [], checks: [{ id: "peers", status: "fail", detail: `the receipt names ${String(peerCount)} attempt(s) in a provider's VM, whose records are read with the key that made the request: set GRAY_API_KEY` }] };
+      peers = { ok: false, peers: [], expired: [], tied: null, checks: [{ id: "peers", status: "fail", detail: `the receipt names ${String(peerCount)} attempt(s) in a provider's VM, whose records are read with the key that made the request: set GRAY_API_KEY` }] };
     } else if (stack === null) {
-      peers = { ok: false, peers: [], checks: [{ id: "peers", status: "fail", detail: `the receipt names ${String(peerCount)} attempt(s) in a provider's VM: pass --allow-stack <Gray's signed stack release list> to check them` }] };
+      peers = { ok: false, peers: [], expired: [], tied: null, checks: [{ id: "peers", status: "fail", detail: `the receipt names ${String(peerCount)} attempt(s) in a provider's VM: pass --allow-stack <Gray's signed stack release list> to check them` }] };
     } else {
       const freshnessFrom = stackFreshnessSource(stack.list, stack.freshness, pins.freshnessKey);
       const freshnessText = freshnessFrom === null
@@ -1784,7 +1911,8 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
         ...(freshnessFrom === null || pins.freshnessKey === null ? {} : { freshness: { text: freshnessText, publicKey: pins.freshnessKey } }),
       };
       peers = await peerChecks({
-        flags: { apiKey, list },
+        // What the receipt's own fetch left of --wait.
+        flags: { apiKey, list, waitS: Math.max(waitS - (fetched?.waitedS ?? 0), 0) },
         origin: attestAt,
         receiptText,
         receipt,
@@ -1799,7 +1927,7 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
   }
 
   const ok = receipt.ok && idCheck.every((entry) => entry.status !== "fail") && (peers === null || peers.ok);
-  const outcome = receiptOutcome(receipt, idCheck.every((entry) => entry.status !== "fail") && (peers === null || peers.ok), attested.verification.osPinned);
+  const outcome = receiptOutcome(receipt, idCheck.every((entry) => entry.status !== "fail") && !peersFailed(peers), peersExpired(peers), attested.verification.osPinned);
   const verdict = outcome.verdict;
   preamble();
   out(fetchLine);
@@ -1809,8 +1937,9 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
     status: "pass",
     detail: `${sealed.digest}; compose ${attested.verification.composeHash ?? "(unpinned)"}${attested.verification.osPinned ? "" : " (OS unpinned, accepted)"}`,
   }]);
+  const shown = joinedReceipt(receipt, peers);
   printChecks(idCheck);
-  printChecks(receipt.checks);
+  printChecks(shown.checks);
   if (peers !== null) printChecks(peers.checks);
   if (outcome.valid) {
     printCheckSummary({
@@ -1821,14 +1950,14 @@ async function checkCommand(given: ParsedArgs): Promise<number> {
       digest: sealed.digest,
       verification: attested.verification,
       releaseKeyHex,
-      receipt,
+      receipt: shown,
       peers,
       responseGiven: responseBytes !== undefined,
     });
   }
   out(`VERDICT: ${verdict}\n`);
-  const machine = checkMachine(receiptMachine({ attested, attestedOk, pins, receipt }), ok, verdict, peers);
-  out(`${toJsonString({ ...machine, checks: [...idCheck.map(checkValue), ...(machine.checks as Json[])] })}\n`);
+  const machine = checkMachine(receiptMachine({ attested, attestedOk, pins, receipt: shown }), ok, verdict, peers);
+  out(`${toJsonString({ ...machine, ...expiredMachine(peers), ...partialMachine(receipt), checks: [...idCheck.map(checkValue), ...(machine.checks as Json[])] })}\n`);
   return ok ? 0 : outcome.code;
 }
 
